@@ -56,7 +56,9 @@ BPW = {
 KV_BITS = {
     "f32": 32.0, "f16": 16.0, "bf16": 16.0,
     "q8_0": 8.5, "q5_1": 6.0, "q5_0": 5.5, "q4_1": 5.0, "q4_0": 4.5, "iq4_nl": 4.5,
-    # TurboQuant (Google, ICLR 2026) — llama.cpp 포크(feature/turboquant-kv-cache) 기준 실험적 값
+    # TurboQuant 전용 타입(tbq3_0/tbq4_0, PR #21089)은 llama.cpp 메인라인에 머지되지 않았음(2026-06 종결).
+    # 메인라인은 대신 K/V 를 양자화 전에 Hadamard 회전(PR #21038, 2026-04, 기본 ON)하여 q4_0 KV 품질을 크게 개선.
+    # 아래 turbo* 값은 포크(TheTom/turboquant_plus 등) 사용 시의 참고용.
     "turbo4": 4.5, "turbo3": 3.5, "turbo2": 2.5,
     # vLLM / exllamav3
     "fp8": 8.0, "exl3-q4": 4.25, "exl3-q6": 6.25,
@@ -141,8 +143,10 @@ class Hardware:
     gpu_bw_gbs: float = 448.0            # GDDR7 28 Gbps × 128-bit
     gpu_bw_eff: float = 0.78             # 디코드 시 실효 대역폭 비율(경험값)
     cpu_name: str = "Ryzen 7 9700X"
-    cpu_bw_gbs: float = 89.6             # DDR5-5600 듀얼채널 이론치 (6000 → 96.0)
-    cpu_bw_eff: float = 0.65             # llama.cpp CPU 디코드 실효 비율(경험값)
+    # 9700X 는 CCD 1개 → Infinity Fabric 읽기 상한 ≈ 64 GB/s (32B/clk × FCLK 2.0GHz). DDR5-6000 의 96 GB/s 를 다 못 씀.
+    # AIDA64 실측 ≈ 52 GB/s(stock). 듀얼 CCD(9900X/9950X)면 --ram-bw 90 정도로 올려서 계산.
+    cpu_bw_gbs: float = 64.0
+    cpu_bw_eff: float = 0.85             # llama.cpp CPU MoE 디코드 실효 비율 → ≈ 54 GB/s
     os: str = "linux"                    # linux | windows
     per_token_overhead_ms: float = 1.5   # 커널 런치/동기화/CPU↔GPU 왕복 등 고정 비용(오프로드 시 증가)
 
@@ -325,7 +329,7 @@ def estimate(m: ModelSpec, hw: Hardware, plan: Plan) -> Budget:
     if m.extra_fixed_gib and "ple" in m.notes.lower():
         notes.append("Gemma PLE(레이어별 임베딩)는 llama.cpp --lazy-mode on 으로 디스크에서 필요 행만 읽어 메모리를 줄일 수 있습니다.")
     if plan.kv_k.lower().startswith("turbo"):
-        notes.append("TurboQuant KV 는 llama.cpp 메인라인이 아닌 포크 기능입니다(실험적).")
+        notes.append("TurboQuant KV 타입은 llama.cpp 메인라인에 없습니다(포크 전용, 실험적). 메인라인에서는 Hadamard 회전 + q4_0/q8_0 KV 를 쓰세요.")
     if hw.os == "windows":
         notes.append("Windows: 모니터가 이 GPU 에 연결되어 있으면 예약 메모리가 더 커질 수 있습니다.")
 
@@ -366,7 +370,7 @@ def print_budget(b: Budget, m: ModelSpec, hw: Hardware) -> None:
     print(f"┌─ {m.name}  ({m.org}, {m.country}; {m.license}; {m.release})")
     if m.notes:
         print(f"│  {m.notes}")
-    print(f"│  하드웨어: {hw.gpu_name} ({hw.gpu_vram_gib:.0f} GiB, {hw.gpu_bw_gbs:.0f} GB/s) + {hw.cpu_name} (DDR5 {hw.cpu_bw_gbs:.1f} GB/s), OS={hw.os}")
+    print(f"│  하드웨어: {hw.gpu_name} ({hw.gpu_vram_gib:.0f} GiB, {hw.gpu_bw_gbs:.0f} GB/s ×{hw.gpu_bw_eff:.2f}) + {hw.cpu_name} (RAM 읽기 {hw.cpu_bw_gbs:.0f} GB/s ×{hw.cpu_bw_eff:.2f}), OS={hw.os}")
     q = p['quant'] + (f" / attn={p['quant_attn']}" if p['quant_attn'] else "") + (f" / out={p['quant_output']}" if p['quant_output'] else "")
     print(f"│  계획: quant={q}, KV={p['kv_k']}/{p['kv_v']}, ctx={p['ctx']:,}, n_cpu_moe={p['n_cpu_moe']}, n_cpu_ffn={p['n_cpu_ffn']}, ubatch={p['ubatch']}")
     print(f"├─ 가중치 파일(전체)      {fmt_gib(b.file_size_gib)}")
@@ -439,7 +443,7 @@ def main(argv=None) -> int:
     ap.add_argument("--moe-cache-hit", type=float, default=0.5, help="전문가 캐시 적중률 가정 (0~1)")
     ap.add_argument("--vram", type=float, default=8.0, help="GPU VRAM GiB")
     ap.add_argument("--gpu-bw", type=float, default=448.0, help="GPU 대역폭 GB/s")
-    ap.add_argument("--ram-bw", type=float, default=89.6, help="시스템 RAM 대역폭 GB/s (DDR5-5600 듀얼=89.6, 6000=96.0, 8000=128)")
+    ap.add_argument("--ram-bw", type=float, default=64.0, help="CPU 가 실제로 읽을 수 있는 RAM 대역폭 상한 GB/s (9700X 단일 CCD = 64 (IF 한계), 9950X 듀얼 CCD ≈ 90, DDR5-6000 이론치 96)")
     ap.add_argument("--os", choices=["linux", "windows"], default="linux")
     ap.add_argument("--sweep", action="store_true", help="모든 프리셋 비교표")
     ap.add_argument("--json", action="store_true")
