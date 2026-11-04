@@ -37,7 +37,9 @@ cd $HOME\Desktop
 powershell -ExecutionPolicy Bypass -File .\nikke-check.ps1
 ```
 
-NIKKE 가 자동으로 찾는 위치(레지스트리 기록, 각 드라이브의 3단계 깊이)에 없다면 설치 폴더를 직접 알려주세요.
+파일을 마우스 오른쪽 버튼으로 눌러 **"PowerShell에서 실행"** 을 골라도 됩니다. 이 경우 결과를 읽을 수 있게 끝에서 Enter 를 기다립니다.
+
+NIKKE 가 자동으로 찾는 위치(레지스트리 기록, 각 드라이브의 4단계 깊이, 사용자 폴더 3단계)에 없다면 설치 폴더를 직접 알려주세요. 여러 개는 쉼표로 구분합니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\nikke-check.ps1 -NikkePath "D:\Games\NIKKE"
@@ -92,7 +94,7 @@ reg query "HKCU\Software\Classes\CLSID\{E77CC89B-7401-4C04-8CED-149DB35ADD04}" /
 
 ### 스크립트가 보는 것 / 못 보는 것
 
-**보는 것:** `Launcher\intl_service\debug.log` 의 `k2f_chan`, `adopted`, `agent started as`, `lua downloaded to` 줄 · `Launcher\log\` 아래 LuaJIT 바이트코드(`1B 4C 4A`) 파일과 `insight.bundle` 다운로드 기록, 에이전트 빌드 ETag · `%APPDATA%\nikke_launcher*` 전체(Code Cache 의 `insightjs.com/l.js?f=…` 로더 항목, Local Storage 의 `k2f.agent.state`, Network Persistent State, HTTP 캐시의 변조/정상 파일 ETag) · Chrome `PlatformExperienceHelper` 의 64자리 16진수 폴더와 `platform_experience_helper.dll` · `HKCU\…\CLSID\{E77CC89B-…}`(WOW6432Node, 다른 로그인 사용자 포함) · `%TEMP%` 의 `k2f-*` 파일 · 실행 중인 `nikke_launcher`/`tbs_browser`, 로드된 악성 DLL · DNS 캐시와 현재 TCP 연결의 공격자 도메인/IP · hosts 차단 여부 · 다른 사용자 프로필(읽을 수 있을 때).
+**보는 것:** `Launcher\intl_service\debug.log` 의 `k2f_chan`, `adopted`, `agent started as`, `lua downloaded to` 줄(크기 제한 없이 끝까지 읽음) · `Launcher\log\` 아래 LuaJIT 바이트코드(`1B 4C 4A`) 파일과 `insight.bundle` 다운로드 기록, 에이전트 빌드 ETag · `%APPDATA%\nikke_launcher*` 전체(Code Cache 의 `insightjs.com/l.js?f=…` 로더 항목, Local Storage 의 `k2f.agent.state`, Network Persistent State, HTTP 캐시의 변조/정상 파일 ETag) · Chrome 및 다른 Chromium 계열(Edge, Brave, Vivaldi, Whale, Opera 등) 프로필의 `PlatformExperienceHelper` 안 64자리 16진수 폴더와 `platform_experience_helper.dll` · `HKCU\…\CLSID\{E77CC89B-…}`(WOW6432Node, 다른 로그인 사용자 포함)와 브라우저 프로필 안 DLL 을 가리키는 다른 HKCU CLSID · `%TEMP%` 의 `k2f-*` 파일 · 실행 중인 `nikke_launcher`/`tbs_browser`, 열려 있는 `k2f` 명명 파이프, 로드된 악성 DLL · DNS 캐시와 현재 TCP 연결의 공격자 도메인/IP · hosts 차단 여부 · 다른 사용자 프로필(읽을 수 있을 때).
 
 **못 보는 것:** 공격자가 실제로 어떤 명령을 실행했는지(로그에 남지 않음) · NIKKE 를 지우거나 재설치한 뒤의 `debug.log`/tinyget 기록 · 이미 삭제된 임시 파일(`k2f-bcreds-*`, `k2f_screen_*.jpg`) · 알려지지 않은 2차 악성코드. **아무것도 없다는 것이 깨끗함을 증명하지 않습니다.**
 

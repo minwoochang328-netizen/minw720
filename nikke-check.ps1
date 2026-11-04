@@ -19,8 +19,11 @@
       https://github.com/Sheisback/nikke_malware_scanner
 
 .PARAMETER NikkePath
-    NIKKE 설치 폴더(예: D:\NIKKE) 또는 그 안의 Launcher 폴더를 직접 지정합니다. 여러 개 지정 가능.
+    NIKKE 설치 폴더(예: D:\NIKKE) 또는 그 안의 Launcher 폴더를 직접 지정합니다.
+    여러 개는 쉼표로 구분합니다 (예: -NikkePath "D:\NIKKE,E:\Games\NIKKE").
     지정하지 않으면 레지스트리와 고정 드라이브에서 자동으로 찾습니다.
+.PARAMETER Pause
+    끝나고 Enter 를 누를 때까지 창을 유지합니다. 탐색기에서 "PowerShell에서 실행"으로 띄운 경우에는 자동으로 적용됩니다.
 .PARAMETER DeepScan
     고정 드라이브 전체를 끝까지 훑어 NIKKE 설치 폴더를 찾습니다. 느립니다.
     기본값은 각 드라이브에서 3단계 깊이까지만 찾습니다.
@@ -49,6 +52,7 @@ param(
     [string]$ReportPath,
     [switch]$NoReportFile,
     [switch]$NoSystemChecks,
+    [switch]$Pause,
     # ---- 아래는 테스트용 경로 재지정 옵션입니다. 일반 사용자는 쓰지 않습니다. ----
     [string]$AppDataOverride,
     [string]$LocalAppDataOverride,
@@ -61,14 +65,16 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 $StartedAt = Get-Date
+# powershell -File 로 넘어온 "A,B" 형태의 경로 목록을 나누고, 따옴표 안 끝 역슬래시 때문에 남는 큰따옴표를 제거합니다.
+$NikkePath = @($NikkePath | ForEach-Object { ([string]$_) -split '\s*[,;]\s*' } | ForEach-Object { ([string]$_).Trim().TrimEnd('"').Trim() } | Where-Object { $_ })
 $onWindows = ($env:OS -eq 'Windows_NT') -or ($PSVersionTable.PSVersion.Major -lt 6)
 $doSystemChecks = $onWindows -and (-not $NoSystemChecks)
 
 # ------------------------------------------------------------------ 감염 지표 (IOC)
 $IOC = @{
-    Domains = @('insightjs.com', 'analytics.insightjs.com', 'insightjs.org')
+    Domains = @('insightjs.com', 'www.insightjs.com', 'analytics.insightjs.com', 'insightjs.org')
     IPs     = @('89.127.233.127', '89.126.250.172')
     Clsid   = '{E77CC89B-7401-4C04-8CED-149DB35ADD04}'
     DllName = 'platform_experience_helper.dll'
@@ -86,13 +92,29 @@ $IOC = @{
         'b7d842200372ad0d9a84ef4cc8511311' = 'FeedList.feb647c9.js'
         'dd06875637a29cddd3bae2ba84142c78' = 'vue-bucket.min.js'
     }
-    # Level Infinite 가 교체한 정상 파일의 ETag
-    CleanEtags = @{
+    # Level Infinite 가 2026-11-03 에 교체한 정상 파일의 ETag. 캐시에 있으면 수정 이후에 런처를 켠 것.
+    FixedEtags = @{
         '44c576454a5b0b4ed60e1a983aa4e782' = 'aegis-fix.min.js'
         '6e5f79cf9b7c364249f9de83ba7fa59e' = 'images.7fec4c32.js'
-        '04ee9800128396ba26f10ca70f170967' = 'FeedList.feb647c9.js'
         '63bc3a47b35b80a5d200dc5624d7126e' = 'vue-bucket.min.js'
     }
+    # 공격 이전 원본과 같은 ETag. 일부 CDN 서버가 공격 기간에도 이 사본을 줬으므로 시점 추정에는 쓸 수 없음.
+    PreAttackEtags = @{
+        '04ee9800128396ba26f10ca70f170967' = 'FeedList.feb647c9.js'
+        '4d0dc9cc23650db9631a2280cfa50186' = 'vue-bucket.min.js'
+    }
+    # Chromium 계열 브라우저의 User Data 위치 (LocalAppData 기준). 에이전트는 Chrome 을 대상으로 하지만 예방적으로 함께 확인.
+    ChromiumUserData = @(
+        @('Chrome',        @('Google', 'Chrome', 'User Data')),
+        @('Chrome Beta',   @('Google', 'Chrome Beta', 'User Data')),
+        @('Chrome Dev',    @('Google', 'Chrome Dev', 'User Data')),
+        @('Chrome Canary', @('Google', 'Chrome SxS', 'User Data')),
+        @('Chromium',      @('Chromium', 'User Data')),
+        @('Edge',          @('Microsoft', 'Edge', 'User Data')),
+        @('Brave',         @('BraveSoftware', 'Brave-Browser', 'User Data')),
+        @('Vivaldi',       @('Vivaldi', 'User Data')),
+        @('Whale',         @('Naver', 'Naver Whale', 'User Data'))
+    )
     # 에이전트(insight.bundle) 다운로드 응답의 ETag (nginx: 수정시각-크기). 알려진 빌드 4개.
     PayloadEtags      = @('6ae78037-3214f', '6ae8ccff-3214f', '6ae90538-3214f', '6ae9f628-3214f')
     PayloadSize       = 205135
@@ -110,8 +132,9 @@ $FileShareAll = [System.IO.FileShare]'ReadWrite, Delete'
 $script:Findings  = New-Object System.Collections.ArrayList
 $script:Locations = New-Object System.Collections.ArrayList
 $script:Notes     = New-Object System.Collections.ArrayList
-$script:Stats     = @{ Files = 0; Bytes = 0; Dirs = 0; Errors = 0; Skipped = 0 }
+$script:Stats     = @{ Files = 0; Bytes = 0; Dirs = 0; Errors = 0; Skipped = 0; CapHit = $false }
 $script:LauncherLastWrite = $null
+$script:DebugLogsChecked = 0
 $script:InstallsFound = New-Object System.Collections.ArrayList
 $script:DataDirsFound = New-Object System.Collections.ArrayList
 
@@ -120,6 +143,7 @@ function Write-Step([string]$Text) { Write-Host $Text -ForegroundColor DarkGray 
 
 function Join-Parts {
     param([string]$Base, [string[]]$Parts)
+    if ([string]::IsNullOrWhiteSpace($Base)) { return '' }
     $p = $Base
     foreach ($x in $Parts) { $p = Join-Path -Path $p -ChildPath $x }
     return $p
@@ -152,6 +176,11 @@ function Add-Finding {
         if (-not $ev.Contains($s)) { [void]$ev.Add($s) }
         if ($ev.Count -ge 5) { break }
     }
+    # 같은 폴더를 두 경로(예: 8.3 짧은 경로)로 두 번 훑었을 때 같은 발견이 두 번 나오지 않게 합니다.
+    $evKey = (@($ev) -join "`n")
+    foreach ($x in $script:Findings) {
+        if ($x.Severity -eq $Severity -and $x.Title -eq $Title -and $x.Path -eq $Path -and ((@($x.Evidence) -join "`n") -eq $evKey)) { return }
+    }
     [void]$script:Findings.Add([pscustomobject]@{
         Severity = $Severity
         Title    = $Title
@@ -168,7 +197,7 @@ function Read-Bytes {
         $fi = New-Object System.IO.FileInfo($Path)
         if (-not $fi.Exists) { return $null }
         if ($fi.Length -gt $MaxFileBytes) { $script:Stats.Skipped++; return $null }
-        if ($script:Stats.Bytes -gt $MaxTotalBytes) { $script:Stats.Skipped++; return $null }
+        if ($script:Stats.Bytes -gt $MaxTotalBytes) { $script:Stats.Skipped++; $script:Stats.CapHit = $true; return $null }
         $len = [int]$fi.Length
         if ($len -eq 0) { $script:Stats.Files++; return , (New-Object byte[] 0) }
         $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $FileShareAll)
@@ -195,20 +224,49 @@ function Read-Bytes {
     }
 }
 
-function Read-TextLines {
-    # UTF-8 텍스트 파일을 줄 단위로 읽습니다. 잠긴 파일도 공유 모드로 읽습니다.
-    param([string]$Path)
-    $lines = New-Object System.Collections.ArrayList
+function Scan-DebugLog([string]$Path) {
+    # debug.log 를 한 줄씩 스트리밍으로 읽어 에이전트 흔적을 셉니다. 크기 제한 없음. 읽기 실패 시 $null.
+    $r = @{
+        Lines = 0; K2f = 0; Runs = 0; Ins = 0; FirstTs = ''; LastTs = ''
+        AgentLines = (New-Object System.Collections.ArrayList)
+        RunTimes   = (New-Object System.Collections.ArrayList)
+    }
     try {
         $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $FileShareAll)
         try {
             $sr = New-Object System.IO.StreamReader($fs, $Utf8, $true)
-            while ($null -ne ($line = $sr.ReadLine())) { [void]$lines.Add($line) }
+            $ci = [System.StringComparison]::OrdinalIgnoreCase
+            $lastLine = ''
+            # 큰 로그(수십 MB)도 빨리 읽도록 줄마다 함수 호출이나 정규식을 쓰지 않습니다.
+            while ($null -ne ($line = $sr.ReadLine())) {
+                $r.Lines++
+                if ($line.Length -eq 0) { continue }
+                if (-not $r.FirstTs) { $r.FirstTs = Get-LogTimestamp $line }
+                $lastLine = $line
+                $isK2f = ($line.IndexOf('k2f_chan', $ci) -ge 0)
+                $isIns = ($line.IndexOf('insightjs', $ci) -ge 0)
+                $isCtx = $false
+                if (-not $isK2f) {
+                    $isCtx = ($line.IndexOf('"adopted ', $ci) -ge 0) -or ($line.IndexOf('agent started as', $ci) -ge 0) -or ($line.IndexOf('lua downloaded to', $ci) -ge 0) -or ($line.IndexOf('"resuming', $ci) -ge 0)
+                }
+                if (-not ($isK2f -or $isIns -or $isCtx)) { continue }
+                if ($isK2f) {
+                    $r.K2f++
+                    if ($line.IndexOf('k2f_chan registered', $ci) -ge 0) {
+                        $r.Runs++
+                        $ts = Get-LogTimestamp $line
+                        if ($ts) { [void]$r.RunTimes.Add($ts) }
+                    }
+                }
+                if ($isIns) { $r.Ins++ }
+                if ($r.AgentLines.Count -lt 60) { [void]$r.AgentLines.Add($line) }
+            }
+            if ($lastLine) { $r.LastTs = Get-LogTimestamp $lastLine }
             $script:Stats.Files++
             $script:Stats.Bytes += $fs.Length
         } finally { $fs.Dispose() }
-    } catch { $script:Stats.Errors++ }
-    return $lines
+    } catch { $script:Stats.Errors++; return $null }
+    return $r
 }
 
 function Test-Contains([string]$Text, [string]$Needle) {
@@ -367,7 +425,7 @@ function Find-Installs {
             if ($v) { $d = Get-InstallFromExePath $v; if ($d) { Add-Install $d } }
             # DisplayName 에 NIKKE 가 들어간 모든 제거 항목
             try {
-                foreach ($sub in (Get-ChildItem -LiteralPath $base -ErrorAction Stop)) {
+                foreach ($sub in (Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue)) {
                     $dn = Get-RegValue $sub.PSPath 'DisplayName'
                     if ($dn -and ($dn -match '(?i)nikke|goddess of victory|승리의 여신')) {
                         foreach ($name in @('InstallLocation', 'GameInstallPath')) {
@@ -390,7 +448,7 @@ function Find-Installs {
 
     # 런처 데이터 폴더의 url_protocol.reg
     foreach ($dd in $script:DataDirsFound) {
-        $reg = Join-Path $dd 'url_protocol.reg'
+        $reg = Join-Path $dd.Path 'url_protocol.reg'
         if (Test-File $reg) {
             try {
                 foreach ($line in (Get-Content -LiteralPath $reg -ErrorAction Stop)) {
@@ -417,10 +475,11 @@ function Find-Installs {
             }
         }
         $commonSubs = @('NIKKE', 'Games\NIKKE', 'Game\NIKKE', 'Program Files\NIKKE', 'Program Files (x86)\NIKKE',
-                        'Level Infinite\NIKKE', 'Games\Level Infinite\NIKKE', 'Program Files\Level Infinite\NIKKE', 'Program Files (x86)\Level Infinite\NIKKE')
+                        'Level Infinite\NIKKE', 'Games\Level Infinite\NIKKE', 'Program Files\Level Infinite\NIKKE', 'Program Files (x86)\Level Infinite\NIKKE',
+                        'SteamLibrary\NIKKE', 'SteamLibrary\steamapps\common\NIKKE', 'Steam\steamapps\common\NIKKE', 'Program Files (x86)\Steam\steamapps\common\NIKKE')
         foreach ($root in $drives) {
             foreach ($sub in $commonSubs) { Add-Install (Join-Path $root $sub) }
-            $maxDepth = 3
+            $maxDepth = 4
             if ($DeepScan) { $maxDepth = 64 }
             $skipNames = @('Windows', '$Recycle.Bin', 'System Volume Information', 'Windows.old', 'ProgramData', '$WinREAgent')
             $queue = New-Object System.Collections.Queue
@@ -445,6 +504,32 @@ function Find-Installs {
                 } catch { $script:Stats.Errors++ }
             }
         }
+        # 사용자 프로필 폴더(바탕 화면, 다운로드, Games 등)는 3단계 더 들어가 봅니다. AppData 는 제외.
+        if ($onWindows -and (Test-Dir $UsersRoot)) {
+            try {
+                foreach ($prof in (Get-ChildItem -LiteralPath $UsersRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+                    if ($prof.Name -in @('Public', 'Default', 'Default User', 'All Users')) { continue }
+                    if (($prof.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    $queue = New-Object System.Collections.Queue
+                    $queue.Enqueue(@($prof.FullName, 0))
+                    while ($queue.Count -gt 0) {
+                        $item = $queue.Dequeue()
+                        $dir = [string]$item[0]; $depth = [int]$item[1]
+                        $l = Join-Path $dir 'Launcher'
+                        if ((Test-File (Join-Path $l 'nikke_launcher.exe')) -or (Test-File (Join-Parts $l @('intl_service', 'debug.log')))) { Add-Install $dir; continue }
+                        if ($depth -ge 3) { continue }
+                        try {
+                            $di = New-Object System.IO.DirectoryInfo($dir)
+                            foreach ($d in $di.GetDirectories()) {
+                                if (($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                                if ($d.Name -in @('AppData', 'node_modules', '.git')) { continue }
+                                $queue.Enqueue(@($d.FullName, $depth + 1))
+                            }
+                        } catch { }
+                    }
+                }
+            } catch { }
+        }
     }
 }
 
@@ -453,12 +538,12 @@ function Find-DataDirs {
     param([string]$AppData, [string]$Owner)
     if (-not (Test-Dir $AppData)) { return }
     try {
-        foreach ($d in (Get-ChildItem -LiteralPath $AppData -Directory -Force -ErrorAction Stop)) {
+        foreach ($d in (Get-ChildItem -LiteralPath $AppData -Directory -Force -ErrorAction SilentlyContinue)) {
             if ($d.Name -match '^(?i)nikke_launcher') {
                 $full = $d.FullName
                 $dup = $false
-                foreach ($e in $script:DataDirsFound) { if ($e -ieq $full) { $dup = $true } }
-                if (-not $dup) { [void]$script:DataDirsFound.Add($full) }
+                foreach ($e in $script:DataDirsFound) { if ($e.Path -ieq $full) { $dup = $true } }
+                if (-not $dup) { [void]$script:DataDirsFound.Add(@{ Path = $full; Owner = $Owner }) }
             }
         }
     } catch { }
@@ -473,45 +558,33 @@ function Check-Install([string]$InstallDir) {
     if (Test-File $dbg) {
         $fi = Get-Item -LiteralPath $dbg
         if ($fi.LastWriteTime -gt $script:LauncherLastWrite) { $script:LauncherLastWrite = $fi.LastWriteTime }
-        if ($fi.Length -gt $MaxFileBytes) {
-            Add-Finding -Severity INFO -Title 'debug.log 가 너무 커서 건너뜀 (64MB 초과)' -Detail '메모장 등으로 열어 k2f_chan 을 직접 검색하세요.' -Path $dbg
+        $scan = Scan-DebugLog $dbg
+        if ($null -eq $scan) {
+            Add-Finding -Severity INFO -Title 'debug.log 를 읽을 수 없어 확인하지 못함' `
+                -Detail '파일이 잠겨 있거나 읽기 권한이 없습니다. 런처를 완전히 종료한 뒤, 관리자 권한 PowerShell 에서 다시 실행하세요. 이 파일을 확인하지 못하면 판정이 불완전합니다.' -Path $dbg
         } else {
-            $lines = Read-TextLines $dbg
-            $agentLines = New-Object System.Collections.ArrayList
-            $k2fCount = 0; $runCount = 0; $insCount = 0
-            $runTimes = New-Object System.Collections.ArrayList
-            $firstTs = ''; $lastTs = ''
-            foreach ($line in $lines) {
-                if ($line.Length -eq 0) { continue }
-                $ts = Get-LogTimestamp $line
-                if ($ts) { if (-not $firstTs) { $firstTs = $ts }; $lastTs = $ts }
-                $hit = $false
-                if (Test-Contains $line 'k2f_chan') {
-                    $k2fCount++; $hit = $true
-                    if (Test-Contains $line 'k2f_chan registered') { $runCount++; if ($ts) { [void]$runTimes.Add($ts) } }
-                } elseif (($line -match '"adopted ') -or (Test-Contains $line 'agent started as') -or (Test-Contains $line 'lua downloaded to') -or ($line -match '"resuming"')) {
-                    $hit = $true
-                }
-                if (Test-Contains $line 'insightjs') { $insCount++; $hit = $true }
-                if ($hit) { [void]$agentLines.Add($line) }
-            }
-            if ($k2fCount -gt 0) {
+            $script:DebugLogsChecked++
+            if ($scan.K2f -gt 0) {
                 $timesText = ''
-                if ($runTimes.Count -gt 0) { $timesText = ' 에이전트 시작 시각(월-일 시:분:초, 연도는 로그에 없음): ' + (($runTimes | Select-Object -Unique | Select-Object -First 10) -join ', ') }
+                if ($scan.RunTimes.Count -gt 0) { $timesText = ' 에이전트 시작 시각(월-일 시:분:초, 연도는 로그에 없음): ' + (($scan.RunTimes | Select-Object -Unique | Select-Object -First 10) -join ', ') }
                 Add-Finding -Severity CRITICAL -Title '원격 제어 에이전트가 이 PC에서 실행된 기록 (debug.log 에 k2f_chan)' `
-                    -Detail ("debug.log 에 'k2f_chan registered' 가 {0}회 기록되어 있습니다. 런처가 켜져 있던 동안 공격자는 이 PC에서 임의 명령 실행, 파일 열람, 화면 캡처, 브라우저 저장 비밀번호·쿠키·토큰 수집을 할 수 있었습니다.{1}" -f $runCount, $timesText) `
-                    -Path $dbg -Evidence @($agentLines)
-            } elseif ($insCount -gt 0) {
+                    -Detail ("debug.log 에 'k2f_chan registered' 가 {0}회 기록되어 있습니다. 런처가 켜져 있던 동안 공격자는 이 PC에서 임의 명령 실행, 파일 열람, 화면 캡처, 브라우저 저장 비밀번호·쿠키·토큰 수집을 할 수 있었습니다.{1}" -f $scan.Runs, $timesText) `
+                    -Path $dbg -Evidence @($scan.AgentLines)
+            } elseif ($scan.Ins -gt 0) {
                 Add-Finding -Severity CRITICAL -Title 'debug.log 에 insightjs (공격자 도메인) 언급' `
-                    -Detail '공격자 도메인이 런처 로그에 남아 있습니다.' -Path $dbg -Evidence @($agentLines)
+                    -Detail '공격자 도메인이 런처 로그에 남아 있습니다.' -Path $dbg -Evidence @($scan.AgentLines)
             } else {
+                $period = ''
+                if ($scan.FirstTs) { $period = (" 로그 기간: {0} ~ {1} (연도 미기록)." -f $scan.FirstTs, $scan.LastTs) }
+                $emptyNote = ''
+                if ($scan.Lines -eq 0) { $emptyNote = ' 파일이 비어 있습니다.' }
                 Add-Finding -Severity INFO -Title 'debug.log 에 에이전트 실행 흔적 없음' `
-                    -Detail ("{0}줄 확인. 마지막 수정: {1}. 로그 기간: {2} ~ {3} (연도 미기록). 런처는 실행마다 이 파일에 덧붙이므로, 파일이 만들어진 뒤의 모든 실행이 들어 있습니다." -f $lines.Count, $fi.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), $firstTs, $lastTs) `
+                    -Detail ("{0:N0}줄 확인. 마지막 수정: {1}.{2}{3} 런처는 실행마다 이 파일에 덧붙이므로, 파일이 만들어진 뒤의 모든 실행이 들어 있습니다." -f $scan.Lines, $fi.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), $period, $emptyNote) `
                     -Path $dbg
             }
         }
     } else {
-        Add-Finding -Severity INFO -Title 'debug.log 없음' `
+        Add-Finding -Severity INFO -Title 'debug.log 없음 (에이전트 실행 여부를 가장 잘 보여 주는 로그를 확인하지 못함)' `
             -Detail 'Launcher\intl_service\debug.log 가 없습니다. NIKKE 를 지웠거나 다시 설치했다면 이전 기록은 사라집니다. 런처 데이터 폴더의 k2f.agent.state 점검 결과를 함께 보세요.' -Path $dbg
     }
 
@@ -564,14 +637,19 @@ function Check-LauncherData([string]$DataDir, [string]$Owner) {
     $tag = ''
     if ($Owner) { $tag = " (사용자 $Owner)" }
     [void]$script:Locations.Add("[런처 데이터] $DataDir$tag")
-    $files = Get-FilesUnder -Root $DataDir -MaxDepth 12
+    # 작은 파일(Local Storage, 캐시 키)을 먼저 읽어 총 읽기 한도에 밀려 건너뛰지 않게 합니다.
+    $files = @(Get-FilesUnder -Root $DataDir -MaxDepth 12 | Sort-Object -Property Length)
+    $skippedBefore = $script:Stats.Skipped
+    $hasTbsCache = Test-Dir (Join-Path $DataDir 'tbs_cache')
+    $analytics = $false
     $agentHits = New-Object System.Collections.ArrayList
     $cacheHits = New-Object System.Collections.ArrayList
     $netHits   = New-Object System.Collections.ArrayList
     $otherHits = New-Object System.Collections.ArrayList
     $loaders   = New-Object System.Collections.ArrayList
     $modEtag   = New-Object System.Collections.ArrayList
-    $cleanEtag = New-Object System.Collections.ArrayList
+    $fixedEtag = New-Object System.Collections.ArrayList
+    $preEtag   = New-Object System.Collections.ArrayList
     $checked = 0
     $netNames = @('Network Persistent State', 'TransportSecurity', 'Reporting and NEL')
 
@@ -595,6 +673,7 @@ function Check-LauncherData([string]$DataDir, [string]$Owner) {
             [void]$agentHits.Add("$full : $line")
         }
         if (Test-Contains $text 'insightjs') {
+            if (Test-Contains $text 'analytics.insightjs') { $analytics = $true }
             $s = @(Get-Snippets -Text $text -Needles @('insightjs') -Max 1)
             $line = ''
             if ($s.Count -gt 0) { $line = $s[0] }
@@ -609,10 +688,14 @@ function Check-LauncherData([string]$DataDir, [string]$Owner) {
             if ($inCodeCache -and $IOC.LoaderCacheNames.ContainsKey($f.Name)) { [void]$loaders.Add(("{0} (캐시 항목 {1})" -f $IOC.LoaderCacheNames[$f.Name], $f.Name)) }
         }
         if ($inHttpCache) {
-            foreach ($k in $IOC.ModifiedEtags.Keys) { if (Test-Contains $text $k) { [void]$modEtag.Add(("{0} (ETag {1}) - {2}" -f $IOC.ModifiedEtags[$k], $k, $f.Name)) } }
-            foreach ($k in $IOC.CleanEtags.Keys)    { if (Test-Contains $text $k) { [void]$cleanEtag.Add(("{0} (ETag {1}) - {2}" -f $IOC.CleanEtags[$k], $k, $f.Name)) } }
+            foreach ($k in $IOC.ModifiedEtags.Keys)  { if (Test-Contains $text $k) { [void]$modEtag.Add(("{0} (ETag {1}) - {2}" -f $IOC.ModifiedEtags[$k], $k, $f.Name)) } }
+            foreach ($k in $IOC.FixedEtags.Keys)     { if (Test-Contains $text $k) { [void]$fixedEtag.Add(("{0} (ETag {1}) - {2}" -f $IOC.FixedEtags[$k], $k, $f.Name)) } }
+            foreach ($k in $IOC.PreAttackEtags.Keys) { if (Test-Contains $text $k) { [void]$preEtag.Add(("{0} (ETag {1}) - {2}" -f $IOC.PreAttackEtags[$k], $k, $f.Name)) } }
         }
     }
+    $skippedHere = $script:Stats.Skipped - $skippedBefore
+    $agentNote = ''
+    if ($analytics) { $agentNote = ' analytics.insightjs.com 은 에이전트(insight.bundle)를 내려받고 교신하는 호스트이므로, 이 기록은 에이전트 단계까지 갔을 가능성을 뜻합니다.' }
 
     if ($agentHits.Count -gt 0) {
         Add-Finding -Severity CRITICAL -Title '런처 데이터에 에이전트 상태(k2f.agent.state) 또는 k2f_chan 기록' `
@@ -623,69 +706,98 @@ function Check-LauncherData([string]$DataDir, [string]$Owner) {
         $ld = ''
         if ($loaders.Count -gt 0) { $ld = ' 확인된 로더: ' + (($loaders | Select-Object -Unique) -join ', ') + '.' }
         Add-Finding -Severity WARNING -Title '런처 내장 브라우저 캐시에 insightjs.com 로더 주소' `
-            -Detail ("변조된 공식 파일이 불러온 악성 스크립트(insightjs.com/l.js)가 런처 안에서 실행됐습니다.{0} 이것만으로 에이전트가 내려받아졌다고 볼 수는 없습니다. 런처를 다시 켜기 전에 tbs_cache 폴더를 지워야 합니다." -f $ld) `
+            -Detail (("변조된 공식 파일이 불러온 악성 스크립트(insightjs.com/l.js)가 런처 안에서 실행됐습니다.{0} 이것만으로 에이전트가 내려받아졌다고 볼 수는 없습니다. 런처를 다시 켜기 전에 tbs_cache 폴더를 지워야 합니다." -f $ld) + $agentNote) `
             -Path $DataDir -Evidence @($cacheHits)
     }
     if ($netHits.Count -gt 0) {
         Add-Finding -Severity WARNING -Title '런처가 insightjs.com 에 접속한 네트워크 상태 기록' `
-            -Detail '런처 내장 브라우저가 공격자 도메인에 연결한 기록입니다.' -Path $DataDir -Evidence @($netHits)
+            -Detail ('런처 내장 브라우저가 공격자 도메인에 연결한 기록입니다.' + $agentNote) -Path $DataDir -Evidence @($netHits)
     }
     if ($otherHits.Count -gt 0) {
-        Add-Finding -Severity WARNING -Title '런처 데이터에 insightjs.com 언급' -Detail '공격자 도메인이 런처 데이터 파일에 남아 있습니다.' -Path $DataDir -Evidence @($otherHits)
+        Add-Finding -Severity WARNING -Title '런처 데이터에 insightjs.com 언급' -Detail ('공격자 도메인이 런처 데이터 파일에 남아 있습니다.' + $agentNote) -Path $DataDir -Evidence @($otherHits)
     }
     if ($modEtag.Count -gt 0) {
         Add-Finding -Severity WARNING -Title '런처 HTTP 캐시에 변조된 공식 파일 사본' `
             -Detail '공격자 코드가 든 공식 파일이 캐시에 남아 있습니다. 런처를 다시 켤 때 이 사본이 쓰일 수 있으니 tbs_cache 를 지운 뒤 켜세요.' -Path $DataDir -Evidence @($modEtag | Select-Object -Unique)
     }
-    if ($cleanEtag.Count -gt 0) {
-        Add-Finding -Severity INFO -Title '런처 HTTP 캐시에 교체된 정상 파일 사본' `
-            -Detail 'Level Infinite 가 교체한 정상 파일이 캐시에 있습니다. 수정 이후에 런처를 켠 적이 있다는 뜻입니다.' -Path $DataDir -Evidence @($cleanEtag | Select-Object -Unique)
+    if ($fixedEtag.Count -gt 0) {
+        Add-Finding -Severity INFO -Title '런처 HTTP 캐시에 11월 3일 교체된 정상 파일 사본' `
+            -Detail 'Level Infinite 가 2026-11-03 에 교체한 정상 파일이 캐시에 있습니다. 수정 이후에 런처를 켠 적이 있다는 뜻입니다.' -Path $DataDir -Evidence @($fixedEtag | Select-Object -Unique)
+    }
+    if ($preEtag.Count -gt 0) {
+        Add-Finding -Severity INFO -Title '런처 HTTP 캐시에 변조되지 않은(공격 이전 원본) 파일 사본' `
+            -Detail '변조되지 않은 사본입니다. 다만 일부 CDN 서버는 공격 기간에도 이 사본을 제공했으므로, 이것만으로 언제 런처를 켰는지는 알 수 없습니다.' -Path $DataDir -Evidence @($preEtag | Select-Object -Unique)
     }
     if ($agentHits.Count -eq 0 -and $cacheHits.Count -eq 0 -and $netHits.Count -eq 0 -and $otherHits.Count -eq 0 -and $modEtag.Count -eq 0) {
-        Add-Finding -Severity INFO -Title '런처 데이터에 흔적 없음' -Detail ("{0}개 파일 확인. k2f, insightjs, 변조 파일 ETag 모두 없음." -f $checked) -Path $DataDir
+        if (-not $hasTbsCache) {
+            Add-Finding -Severity INFO -Title '런처 데이터에 tbs_cache 폴더가 없어 Local Storage/캐시 흔적은 확인할 수 없음' `
+                -Detail ("{0}개 파일 확인. k2f.agent.state 와 로더 캐시는 tbs_cache 안에 저장되므로, 이미 지웠다면 그 흔적도 함께 사라진 것입니다. debug.log 결과를 기준으로 판단하세요." -f $checked) -Path $DataDir
+        } elseif ($skippedHere -gt 0) {
+            Add-Finding -Severity INFO -Title '런처 데이터에 흔적 없음 (일부 파일은 확인하지 못함)' `
+                -Detail ("{0}개 파일 확인, {1}개는 크기(64MB 초과) 또는 총 읽기 한도(3GB) 때문에 건너뜀. 확인한 파일에서는 k2f, insightjs, 변조 파일 ETag 모두 없음." -f $checked, $skippedHere) -Path $DataDir
+        } else {
+            Add-Finding -Severity INFO -Title '런처 데이터에 흔적 없음' -Detail ("{0}개 파일 확인. k2f, insightjs, 변조 파일 ETag 모두 없음." -f $checked) -Path $DataDir
+        }
+    } elseif ($skippedHere -gt 0) {
+        Add-Finding -Severity INFO -Title '런처 데이터의 일부 파일은 확인하지 못함' -Detail ("{0}개 파일은 크기(64MB 초과) 또는 총 읽기 한도(3GB) 때문에 건너뛰었습니다." -f $skippedHere) -Path $DataDir
     }
 }
 
 # ------------------------------------------------------------------ 5. 사용자 프로필 점검 (Chrome 지속성 DLL, Temp)
-function Check-ChromeHelper([string]$LocalAppData, [string]$Owner) {
+function Check-ChromeHelper([string]$LocalAppData, [string]$AppData, [string]$Owner) {
     $tag = ''
     if ($Owner) { $tag = " (사용자 $Owner)" }
-    $peh = Join-Parts $LocalAppData @('Google', 'Chrome', 'User Data', 'PlatformExperienceHelper')
-    if (Test-Dir $peh) {
+    # 브라우저 프로필(User Data)마다 PlatformExperienceHelper 폴더를 확인합니다. 에이전트는 Chrome 을 대상으로 하지만 다른 Chromium 계열도 예방적으로 봅니다.
+    $roots = @()
+    if ($LocalAppData) { foreach ($b in $IOC.ChromiumUserData) { $roots += , @($b[0], (Join-Parts $LocalAppData $b[1])) } }
+    if ($AppData) {
+        $roots += , @('Opera', (Join-Parts $AppData @('Opera Software', 'Opera Stable')))
+        $roots += , @('Opera GX', (Join-Parts $AppData @('Opera Software', 'Opera GX Stable')))
+    }
+    foreach ($r in $roots) {
+        $browser = $r[0]
+        $peh = Join-Path $r[1] 'PlatformExperienceHelper'
+        if (-not (Test-Dir $peh)) { continue }
         $all = @(Get-ChildItem -LiteralPath $peh -Recurse -Force -Depth 4 -ErrorAction SilentlyContinue)
         $dlls = @($all | Where-Object { -not $_.PSIsContainer -and $_.Name -ieq $IOC.DllName })
         $hexDirs = @(Get-ChildItem -LiteralPath $peh -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[0-9a-fA-F]{64}$' })
         if ($dlls.Count -gt 0) {
             $ev = @()
             foreach ($d in $dlls) { $ev += ("{0} ({1:N0} 바이트, 수정 {2})" -f $d.FullName, $d.Length, $d.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) }
-            Add-Finding -Severity CRITICAL -Title "Chrome 지속성 DLL 발견$tag" `
-                -Detail '공격자가 Chrome 이 불러오도록 등록한 DLL 입니다. 런처를 꺼도 계속 동작하며 웹페이지에 입력하는 비밀번호와 지갑 복구 문구를 읽는다고 보고됐습니다. 레지스트리 키 삭제 -> 재부팅 -> 이 하위 폴더 삭제 순서로 제거하세요. (Defender 가 탐지하지 못한 사례가 있습니다)' `
+            Add-Finding -Severity CRITICAL -Title "$browser 지속성 DLL 발견$tag" `
+                -Detail '공격자가 브라우저가 불러오도록 등록한 DLL 입니다. 런처를 꺼도 계속 동작하며 웹페이지에 입력하는 비밀번호와 지갑 복구 문구를 읽는다고 보고됐습니다. 레지스트리 키 삭제 -> 재부팅 -> 이 하위 폴더 삭제 순서로 제거하세요. (Defender 가 탐지하지 못한 사례가 있습니다)' `
                 -Path $peh -Evidence $ev
         } elseif ($hexDirs.Count -gt 0) {
             $ev = @()
             foreach ($d in $hexDirs) { $ev += $d.FullName }
-            Add-Finding -Severity CRITICAL -Title "Chrome PlatformExperienceHelper 아래 64자리 16진수 폴더 (악성 폴더 구조)$tag" `
+            Add-Finding -Severity CRITICAL -Title "$browser PlatformExperienceHelper 아래 64자리 16진수 폴더 (악성 폴더 구조)$tag" `
                 -Detail '에이전트는 서버가 준 SHA-256 이름의 하위 폴더에 DLL 을 넣습니다. DLL 은 없지만 폴더가 남아 있어 설치됐다가 제거된 것일 수 있습니다.' -Path $peh -Evidence $ev
         } else {
             $ev = @()
             foreach ($e in ($all | Select-Object -First 5)) { $ev += $e.Name }
-            Add-Finding -Severity INFO -Title "Chrome PlatformExperienceHelper 폴더는 정상 구성$tag" `
+            Add-Finding -Severity INFO -Title "$browser PlatformExperienceHelper 폴더는 정상 구성$tag" `
                 -Detail 'platform_experience_helper.dll 도, 64자리 16진수 하위 폴더도 없습니다. Chrome 자체가 만드는 폴더(platform_experience_helper.exe, LoadFeatures)입니다.' -Path $peh -Evidence $ev
         }
     }
-    # Chrome 설치 폴더 쪽 잔재 (이전 버전 에이전트의 정리 대상 파일명)
-    $appRoots = @((Join-Parts $LocalAppData @('Google', 'Chrome', 'Application')))
+    # Chrome 설치 폴더 쪽 잔재 (이전 버전 에이전트의 정리 루틴이 지우는 파일 이름)
+    $appRoots = @()
+    if ($LocalAppData) { $appRoots += (Join-Parts $LocalAppData @('Google', 'Chrome', 'Application')) }
     if (-not $Owner) {
         foreach ($pf in @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
             if ($pf) { $appRoots += (Join-Parts $pf @('Google', 'Chrome', 'Application')) }
         }
     }
-    foreach ($ar in $appRoots) {
+    foreach ($ar in @($appRoots | Select-Object -Unique)) {
         if (-not (Test-Dir $ar)) { continue }
         foreach ($f in (Get-FilesUnder -Root $ar -MaxDepth 3)) {
-            if ($f.Directory.Name -ieq 'PlatformExperienceHelper' -and ($f.Name -ieq $IOC.DllName -or $f.Name -ieq 'platform_experience_helper.dll.old' -or $f.Name -ieq 'old-clsid.txt')) {
+            if ($f.Directory.Name -ine 'PlatformExperienceHelper') { continue }
+            if ($f.Name -ieq $IOC.DllName -or $f.Name -ieq 'platform_experience_helper.dll.old') {
+                Add-Finding -Severity CRITICAL -Title "Chrome 설치 폴더의 PlatformExperienceHelper 에 DLL (이전 버전 에이전트의 지속성 파일로 추정)$tag" `
+                    -Detail '정상 Chrome 은 이 자리에 .dll 을 두지 않습니다(정상 구성 요소는 .exe 입니다). 에이전트의 정리 루틴이 지우는 파일 이름과 같습니다. 지속성 DLL 과 같은 순서(레지스트리 키 삭제 -> 재부팅 -> 파일 삭제)로 제거하세요.' -Path $f.FullName `
+                    -Evidence @(("{0:N0} 바이트, 수정 {1}" -f $f.Length, $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')))
+            } elseif ($f.Name -ieq 'old-clsid.txt' -or $f.Name -ieq 'service_util.dll') {
                 Add-Finding -Severity WARNING -Title "Chrome 설치 폴더의 PlatformExperienceHelper 에 의심 파일$tag" `
-                    -Detail '에이전트의 정리 루틴이 지우는 파일 이름과 같습니다(이전 버전 잔재로 추정). 정상 Chrome 은 이 자리에 .dll 을 두지 않습니다.' -Path $f.FullName
+                    -Detail '에이전트의 정리 루틴이 지우는 파일 이름과 같습니다(이전 버전 잔재로 추정).' -Path $f.FullName
             }
         }
     }
@@ -697,10 +809,11 @@ function Check-Temp([string]$TempDir, [string]$Owner) {
     if ($Owner) { $tag = " (사용자 $Owner)" }
     $k2f = @(); $hex = @()
     try {
-        foreach ($f in (Get-ChildItem -LiteralPath $TempDir -File -Force -ErrorAction Stop)) {
-            if ($f.Name -match '^(?i)k2f') { $k2f += ("{0} ({1} 바이트, {2})" -f $f.Name, $f.Length, $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) }
-            elseif ($f.Name -match '(?i)insight\.bundle') { $k2f += $f.Name }
-            elseif ($f.Extension -ieq '.tmp' -and $f.Length -eq 22) {
+        $tempFull = (Get-Item -LiteralPath $TempDir).FullName
+        foreach ($f in (Get-FilesUnder -Root $TempDir -MaxDepth 1)) {
+            if ($f.Name -match '^(?i)k2f') { $k2f += ("{0} ({1} 바이트, {2})" -f $f.FullName, $f.Length, $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) }
+            elseif ($f.Name -match '(?i)insight\.bundle') { $k2f += $f.FullName }
+            elseif ($f.DirectoryName -ieq $tempFull -and $f.Extension -ieq '.tmp' -and $f.Length -eq 22) {
                 $b = Read-Bytes -Path $f.FullName
                 if ($null -ne $b) { $t = $Latin1.GetString($b); if ($t -match '^[0-9a-f]{22}$') { $hex += ("{0}: {1} ({2})" -f $f.Name, $t, $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) } }
             }
@@ -756,8 +869,24 @@ function Check-Registry {
             }
         }
     } catch { }
+    # 변형 대비: HKCU 의 다른 CLSID 가 브라우저 프로필(User Data) 안의 DLL 이나 PlatformExperienceHelper 를 가리키는지
+    try {
+        foreach ($clsRoot in @('HKCU:\Software\Classes\CLSID', 'HKCU:\Software\Classes\WOW6432Node\CLSID')) {
+            if (-not (Test-Path -LiteralPath $clsRoot)) { continue }
+            foreach ($k in (Get-ChildItem -LiteralPath $clsRoot -ErrorAction SilentlyContinue)) {
+                if ($k.PSChildName -ieq $IOC.Clsid) { continue }
+                $v = Get-RegValue (Join-Path $k.PSPath 'InprocServer32') ''
+                if (-not $v) { continue }
+                if (($v -match '(?i)\\User Data\\') -or ($v -match '(?i)PlatformExperienceHelper') -or ($v -match '(?i)platform_experience_helper\.dll')) {
+                    $hits++
+                    Add-Finding -Severity CRITICAL -Title 'HKCU 의 다른 CLSID 가 브라우저 프로필 안의 DLL 을 가리킴 (변형 지속성 의심)' `
+                        -Detail '정상적인 COM 등록은 브라우저 User Data 폴더 안의 DLL 을 가리키지 않습니다. 알려진 CLSID 가 아니어도 같은 수법일 수 있으니, 가리키는 DLL 을 확인하고 같은 순서로 제거하세요.' -Path $k.PSPath -Evidence @("InprocServer32 (기본값) = $v")
+                }
+            }
+        }
+    } catch { }
     if ($hits -eq 0) {
-        Add-Finding -Severity INFO -Title '레지스트리 지속성 키 없음' -Detail ("HKCU\Software\Classes\CLSID\{0} (및 WOW6432Node) 가 없습니다." -f $IOC.Clsid)
+        Add-Finding -Severity INFO -Title '레지스트리 지속성 키 없음' -Detail ("HKCU\Software\Classes\CLSID\{0} (및 WOW6432Node) 가 없고, 브라우저 프로필 안의 DLL 을 가리키는 다른 HKCU CLSID 도 없습니다." -f $IOC.Clsid)
     }
 }
 
@@ -786,6 +915,16 @@ function Check-Processes {
         if ($rows.Count -gt 0) {
             Add-Finding -Severity CRITICAL -Title '악성 DLL(platform_experience_helper.dll)이 현재 프로세스에 로드됨' `
                 -Detail '지속성 DLL 이 지금 동작 중입니다. 인터넷 연결을 끊고 레지스트리 키를 지운 뒤 재부팅하세요.' -Evidence $rows
+        }
+    } catch { }
+
+    # 에이전트의 제어 채널(k2f_chan)은 명명 파이프로 보고됨. 열려 있으면 지금 동작 중.
+    try {
+        $pipes = @([System.IO.Directory]::GetFiles('\\.\pipe\'))
+        $k2fPipes = @($pipes | Where-Object { $_ -match '(?i)k2f' })
+        if ($k2fPipes.Count -gt 0) {
+            Add-Finding -Severity CRITICAL -Title '에이전트의 제어 채널(k2f 명명 파이프)이 지금 열려 있음' `
+                -Detail '에이전트가 현재 이 PC에서 동작하고 있습니다. 즉시 인터넷 연결을 끊고 런처(nikke_launcher.exe, tbs_browser.exe)를 종료하세요.' -Evidence $k2fPipes
         }
     } catch { }
 }
@@ -869,7 +1008,7 @@ function Check-Network {
     }
     $detail = 'hosts 파일로 공격자 도메인을 막아두면 남아 있는 캐시나 아직 교체되지 않은 CDN 서버의 변조 파일이 다시 로더를 불러도 연결이 되지 않습니다. 이 항목은 감염 여부가 아닌 보호 상태입니다.'
     if ($hostsNote) { $detail = $hostsNote + ' ' + $detail }
-    if ($missing.Count -gt 0) { $detail += ' 관리자 권한 메모장으로 hosts 파일 끝에 다음 줄을 추가하세요: ' + ($missing -join ' / ') + ' . IP 89.127.233.127 은 hosts 로 막을 수 없으니 방화벽에서 차단하세요.' }
+    if ($missing.Count -gt 0) { $detail += ' 관리자 권한 메모장으로 hosts 파일 끝에 다음 줄을 추가하세요: ' + ($missing -join ' / ') + ' . IP 89.127.233.127 과 89.126.250.172 는 hosts 로 막을 수 없으니 방화벽에서 차단하세요.' }
     Add-Finding -Severity INFO -Title '보호 상태: hosts 파일의 공격자 도메인 차단 여부' -Detail $detail -Path $hostsPath -Evidence $ev
 }
 
@@ -933,56 +1072,66 @@ if ($onWindows) {
     try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { }
 }
 
-# 런처 데이터 폴더 (현재 사용자)
+# [1/8] 런처 데이터 폴더: 현재 사용자 + 읽을 수 있는 다른 사용자 프로필
 Write-Step '[1/8] 런처 데이터 폴더(%APPDATA%\nikke_launcher*)를 찾는 중...'
 Find-DataDirs -AppData $AppData -Owner ''
 if ($AppDataOverride -and -not $LocalAppDataOverride) { $LocalAppData = Join-Parts (Split-Path -Path $AppDataOverride -Parent) @('Local') }
+
+$otherProfiles = @()
+if (Test-Dir $UsersRoot) {
+    $skipProfiles = @('Public', 'Default', 'Default User', 'All Users', 'desktop.ini')
+    $myProfileFull = ''
+    try { if ($UserProfile) { $myProfileFull = (Get-Item -LiteralPath $UserProfile -ErrorAction Stop).FullName } } catch { }
+    try {
+        foreach ($prof in (Get-ChildItem -LiteralPath $UsersRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+            if ($skipProfiles -contains $prof.Name) { continue }
+            if ($myProfileFull -and ($prof.FullName -ieq $myProfileFull)) { continue }
+            if (($prof.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            $roam  = Join-Parts $prof.FullName @('AppData', 'Roaming')
+            $local = Join-Parts $prof.FullName @('AppData', 'Local')
+            if (-not (Test-Dir $roam) -and -not (Test-Dir $local)) { continue }
+            $readable = $false
+            foreach ($probe in @($local, $roam)) {
+                if (-not (Test-Dir $probe)) { continue }
+                try { [void](Get-ChildItem -LiteralPath $probe -Force -ErrorAction Stop | Select-Object -First 1); $readable = $true } catch { }
+            }
+            if (-not $readable) {
+                [void]$script:Notes.Add(("다른 사용자 프로필 {0} 은(는) 읽을 수 없어 점검하지 못했습니다. 관리자 권한 PowerShell 에서 다시 실행하면 확인됩니다." -f $prof.FullName))
+                continue
+            }
+            $otherProfiles += , @{ Name = $prof.Name; Path = $prof.FullName; Roam = $roam; Local = $local }
+            Find-DataDirs -AppData $roam -Owner $prof.Name
+        }
+    } catch { }
+}
 
 Find-Installs
 
 if ($script:InstallsFound.Count -eq 0 -and $script:DataDirsFound.Count -eq 0) {
     [void]$script:Notes.Add('NIKKE 설치 폴더와 런처 데이터 폴더를 찾지 못했습니다. 다른 위치에 설치했다면 -NikkePath "경로" 로 지정하거나 -DeepScan 으로 다시 실행하세요.')
+} elseif ($script:InstallsFound.Count -eq 0) {
+    Add-Finding -Severity INFO -Title 'NIKKE 설치 폴더를 찾지 못해 debug.log 와 다운로드 로그는 확인하지 못함' `
+        -Detail '런처 데이터 폴더만 확인했습니다. NIKKE 를 지웠거나 재설치했다면 이전 로그는 사라진 것이고, 다른 위치에 설치했다면 -NikkePath "경로" 로 지정해 다시 실행하세요.'
 }
 
 Write-Step '[3/8] NIKKE 설치 폴더의 debug.log 와 다운로드 로그를 확인하는 중...'
 foreach ($inst in @($script:InstallsFound)) { Check-Install $inst }
 
 Write-Step '[4/8] 런처 데이터 폴더(캐시, Local Storage)를 확인하는 중...'
-foreach ($dd in @($script:DataDirsFound)) { Check-LauncherData -DataDir $dd -Owner '' }
+foreach ($dd in @($script:DataDirsFound)) { Check-LauncherData -DataDir $dd.Path -Owner $dd.Owner }
 
-Write-Step '[5/8] 사용자 프로필(Chrome 지속성 DLL, Temp)을 확인하는 중...'
+Write-Step '[5/8] 사용자 프로필(브라우저 지속성 DLL, Temp)을 확인하는 중...'
 [void]$script:Locations.Add("[사용자 프로필] $UserProfile")
-Check-ChromeHelper -LocalAppData $LocalAppData -Owner ''
+Check-ChromeHelper -LocalAppData $LocalAppData -AppData $AppData -Owner ''
 Check-Temp -TempDir $TempDir -Owner ''
-$localTemp = Join-Path $LocalAppData 'Temp'
+$localTemp = ''
+if ($LocalAppData) { $localTemp = Join-Path $LocalAppData 'Temp' }
 if ($TempDir -and $localTemp -and ($localTemp -ine $TempDir)) { Check-Temp -TempDir $localTemp -Owner '' }
 Check-Context -UserProfile $UserProfile -AppData $AppData -LocalAppData $LocalAppData
-
-# 다른 사용자 프로필
-if (Test-Dir $UsersRoot) {
-    $skipProfiles = @('Public', 'Default', 'Default User', 'All Users', 'desktop.ini')
-    try {
-        foreach ($prof in (Get-ChildItem -LiteralPath $UsersRoot -Directory -Force -ErrorAction Stop)) {
-            if ($skipProfiles -contains $prof.Name) { continue }
-            if ($UserProfile -and ($prof.FullName -ieq (Get-Item -LiteralPath $UserProfile -ErrorAction SilentlyContinue).FullName)) { continue }
-            if (($prof.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-            $roam  = Join-Parts $prof.FullName @('AppData', 'Roaming')
-            $local = Join-Parts $prof.FullName @('AppData', 'Local')
-            if (-not (Test-Dir $roam) -and -not (Test-Dir $local)) { continue }
-            $readable = $true
-            try { [void](Get-ChildItem -LiteralPath $local -Force -ErrorAction Stop | Select-Object -First 1) } catch { $readable = $false }
-            if (-not $readable) {
-                [void]$script:Notes.Add(("다른 사용자 프로필 {0} 은(는) 읽을 수 없어 점검하지 못했습니다. 관리자 권한 PowerShell 에서 다시 실행하면 확인됩니다." -f $prof.FullName))
-                continue
-            }
-            [void]$script:Locations.Add("[사용자 프로필] $($prof.FullName)")
-            $before = $script:DataDirsFound.Count
-            Find-DataDirs -AppData $roam -Owner $prof.Name
-            for ($i = $before; $i -lt $script:DataDirsFound.Count; $i++) { Check-LauncherData -DataDir $script:DataDirsFound[$i] -Owner $prof.Name }
-            Check-ChromeHelper -LocalAppData $local -Owner $prof.Name
-            Check-Temp -TempDir (Join-Path $local 'Temp') -Owner $prof.Name
-        }
-    } catch { }
+foreach ($op in $otherProfiles) {
+    [void]$script:Locations.Add("[사용자 프로필] $($op.Path)")
+    Check-ChromeHelper -LocalAppData $op.Local -AppData $op.Roam -Owner $op.Name
+    Check-Temp -TempDir (Join-Path $op.Local 'Temp') -Owner $op.Name
 }
 
 if ($doSystemChecks) {
@@ -1014,7 +1163,11 @@ if ($crit.Count -gt 0) {
 } elseif ($foundNikke) {
     $verdict = 'NO_TRACES'; $exitCode = 0
     $verdictTitle = '흔적 없음'
-    $verdictText  = '찾은 NIKKE 파일에서 악성 스크립트나 에이전트의 흔적을 찾지 못했습니다. 아무것도 없다는 것이 깨끗함을 증명하지는 않습니다.'
+    if ($script:InstallsFound.Count -gt 0) {
+        $verdictText = '찾은 NIKKE 파일에서 악성 스크립트나 에이전트의 흔적을 찾지 못했습니다. 아무것도 없다는 것이 깨끗함을 증명하지는 않습니다.'
+    } else {
+        $verdictText = '런처 데이터 폴더에서 악성 스크립트나 에이전트의 흔적을 찾지 못했습니다. NIKKE 설치 폴더(debug.log, 다운로드 로그)는 찾지 못해 확인하지 않았습니다. 아무것도 없다는 것이 깨끗함을 증명하지는 않습니다.'
+    }
 } else {
     $verdict = 'NOT_FOUND'; $exitCode = 3
     $verdictTitle = 'NIKKE 미발견'
@@ -1023,6 +1176,10 @@ if ($crit.Count -gt 0) {
 
 $launchedAfterOct24 = $false
 if ($script:LauncherLastWrite -and $script:LauncherLastWrite -ge (Get-Date -Year 2026 -Month 10 -Day 24 -Hour 0 -Minute 0 -Second 0)) { $launchedAfterOct24 = $true }
+$debugLogNote = ''
+if ($script:DebugLogsChecked -eq 0 -and ($verdict -eq 'NO_TRACES' -or $verdict -eq 'EXPOSED')) {
+    $debugLogNote = '주의: 에이전트 실행 여부를 가장 잘 보여 주는 로그(Launcher\intl_service\debug.log)를 하나도 확인하지 못했으므로 이 판정은 불완전합니다. (설치 폴더 미발견, NIKKE 삭제/재설치, 또는 읽기 권한 문제)'
+}
 
 # ================================================================== 보고서 작성
 $R = New-Object System.Collections.ArrayList
@@ -1038,6 +1195,7 @@ L ("PowerShell {0}   OS: {1}" -f $PSVersionTable.PSVersion.ToString(), [System.E
 L ''
 L ("판정: {0}" -f $verdictTitle)
 L $verdictText
+if ($debugLogNote) { L $debugLogNote }
 if ($launchedAfterOct24 -and $verdict -ne 'INFECTED') { L ("참고: debug.log 마지막 수정이 {0} 이라 2026-10-24 이후에 런처를 실행한 기록이 있습니다. 에이전트는 10월 24일부터 일부 실행에서만 배포됐으므로, 흔적이 없어도 비밀번호 변경을 권합니다." -f $script:LauncherLastWrite.ToString('yyyy-MM-dd HH:mm')) }
 L ''
 L '확인한 위치:'
@@ -1062,7 +1220,7 @@ switch ($verdict) {
         L ' 2. Level Infinite 가 수정 완료를 공식 발표하기 전까지 런처를 다시 켜지 마세요.'
         L ' 3. 이 보고서 파일을 먼저 보관하세요. tbs_cache 를 지우면 k2f.agent.state 흔적도 함께 사라집니다.'
         L ' 4. 런처를 다시 켜기 전에 %APPDATA%\nikke_launcher\tbs_cache 폴더를 지우세요. (변조 파일이 캐시에 남아 있을 수 있음)'
-        L ' 5. hosts 파일에 insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 을 차단하세요.'
+        L ' 5. hosts 파일에 insightjs.com / www.insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 과 89.126.250.172 를 차단하세요.'
         L ' 6. "Chrome 지속성 DLL" 또는 "레지스트리 지속성" 이 발견됐다면: HKCU\Software\Classes\CLSID\{E77CC89B-7401-4C04-8CED-149DB35ADD04} 삭제 -> 재부팅 -> PlatformExperienceHelper 아래 64자리 16진수 폴더 삭제. (HKLM 의 같은 CLSID 는 Windows 정상 항목이니 건드리지 마세요)'
         L ' 7. 가장 확실한 복구는 Windows 재설치입니다. 에이전트는 임의 명령을 실행할 수 있었고, 어떤 명령이 실행됐는지 로그에 남지 않습니다.'
         L ' 8. 깨끗한 기기(스마트폰 등)에서 비밀번호를 바꾸세요: NIKKE/Level Infinite -> 이메일 -> Discord -> 금융 -> 브라우저에 저장된 모든 비밀번호. 2단계 인증을 켜세요.'
@@ -1073,19 +1231,19 @@ switch ($verdict) {
     'EXPOSED' {
         L ' 1. Level Infinite 가 수정 완료를 공식 발표하기 전까지 런처를 켜지 마세요.'
         L ' 2. 런처를 다시 켜기 전에 %APPDATA%\nikke_launcher\tbs_cache 폴더를 지우세요. (변조 파일이 캐시에 남아 있을 수 있음)'
-        L ' 3. hosts 파일에 insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 을 차단하세요.'
+        L ' 3. hosts 파일에 insightjs.com / www.insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 과 89.126.250.172 를 차단하세요.'
         L ' 4. 에이전트는 2026-10-24 부터 일부 실행에서만 배포됐습니다. 그 이후에 런처를 켠 적이 있다면 감염된 것처럼 대응하세요: 깨끗한 기기에서 비밀번호 변경(NIKKE -> 이메일 -> Discord -> 금융 -> 브라우저 저장 비밀번호), 모든 세션 로그아웃, API 토큰·SSH 키 폐기, 암호화폐는 새 지갑으로 이동.'
     }
     'NO_TRACES' {
         L ' 1. Level Infinite 가 수정 완료를 공식 발표하기 전까지 런처를 켜지 마세요.'
         L ' 2. 런처를 다시 켜기 전에 %APPDATA%\nikke_launcher\tbs_cache 폴더를 지우세요.'
-        L ' 3. hosts 파일에 insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 을 차단하세요.'
+        L ' 3. hosts 파일에 insightjs.com / www.insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 과 89.126.250.172 를 차단하세요.'
         L ' 4. 2026-10-24 이후에 런처를 켠 적이 있다면 깨끗한 기기에서 NIKKE/Level Infinite 비밀번호는 바꿔 두세요.'
     }
     default {
         L ' 1. NIKKE 를 다른 곳에 설치했다면 -NikkePath "설치폴더" 를 지정하거나 -DeepScan 으로 다시 실행하세요.'
         L ' 2. Level Infinite 가 수정 완료를 공식 발표하기 전까지 런처를 켜지 마세요.'
-        L ' 3. hosts 파일에 insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 을 차단하세요.'
+        L ' 3. hosts 파일에 insightjs.com / www.insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 과 89.126.250.172 를 차단하세요.'
     }
 }
 L ''
@@ -1119,9 +1277,16 @@ if (-not $NoReportFile) {
         if (-not $ReportPath) {
             $desktop = ''
             try { $desktop = [System.Environment]::GetFolderPath('Desktop') } catch { }
+            if ((Test-Dir $desktop) -and ($desktop -match '(?i)OneDrive') -and (Test-Dir $UserProfile)) {
+                # OneDrive 와 동기화되는 바탕화면이면 개인 정보가 든 보고서가 클라우드에 올라가지 않도록 사용자 폴더에 저장
+                $desktop = $UserProfile
+                Write-Host '바탕화면이 OneDrive 와 동기화되어 있어 보고서를 사용자 폴더(C:\Users\사용자이름)에 저장합니다.' -ForegroundColor DarkGray
+            }
             if (-not (Test-Dir $desktop)) { $desktop = (Get-Location).Path }
             $ReportPath = Join-Path $desktop ("NIKKE_점검결과_{0}.txt" -f $StartedAt.ToString('yyyyMMdd_HHmmss'))
         }
+        # 상대 경로는 PowerShell 의 현재 위치 기준으로 풉니다 (.NET 은 프로세스 작업 폴더를 쓰므로 다를 수 있음).
+        try { $ReportPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportPath) } catch { }
         $utf8bom = New-Object System.Text.UTF8Encoding($true)
         [System.IO.File]::WriteAllText($ReportPath, (($R -join "`r`n") + "`r`n"), $utf8bom)
         Write-Host ''
@@ -1130,6 +1295,20 @@ if (-not $NoReportFile) {
     } catch {
         Write-Host ("보고서 파일을 저장하지 못했습니다: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
     }
+}
+
+# 탐색기에서 "PowerShell에서 실행"으로 띄웠으면 창이 바로 닫히므로 Enter 를 기다립니다.
+$pauseNow = [bool]$Pause
+if (-not $pauseNow -and $onWindows) {
+    try {
+        $pp = (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -ErrorAction Stop).ParentProcessId
+        $pn = (Get-Process -Id $pp -ErrorAction Stop).ProcessName
+        if ($pn -ieq 'explorer') { $pauseNow = $true }
+    } catch { }
+}
+if ($pauseNow) {
+    Write-Host ''
+    try { Read-Host '확인했으면 Enter 키를 누르세요 (창이 닫힙니다)' | Out-Null } catch { }
 }
 
 exit $exitCode
