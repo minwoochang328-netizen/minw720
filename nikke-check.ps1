@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     2026-09-27부터 2026-11-03까지 Level Infinite CDN의 공식 JavaScript 파일 4개가 변조되어
-    NIKKE PC 런처가 insightjs.com 의 악성 스크립트를 불러왔고, 10월 24일 이후 일부 실행에서
+    NIKKE PC 런처가 insightjs.com 의 악성 스크립트를 불러왔고, 늦어도 10월 24일부터 일부 실행에서
     원격 제어 에이전트(insight.bundle, LuaJIT 바이트코드)를 내려받아 런처 안에서 실행했습니다.
     이 스크립트는 공개된 감염 지표(IOC)를 바탕으로 이 PC에 남은 흔적을 찾습니다.
 
@@ -26,7 +26,7 @@
     끝나고 Enter 를 누를 때까지 창을 유지합니다. 탐색기에서 "PowerShell에서 실행"으로 띄운 경우에는 자동으로 적용됩니다.
 .PARAMETER DeepScan
     고정 드라이브 전체를 끝까지 훑어 NIKKE 설치 폴더를 찾습니다. 느립니다.
-    기본값은 각 드라이브에서 3단계 깊이까지만 찾습니다.
+    기본값은 각 드라이브에서 4단계, 사용자 폴더에서 3단계 깊이까지만 찾습니다.
 .PARAMETER ReportPath
     보고서 저장 경로. 기본값은 바탕화면\NIKKE_점검결과_yyyyMMdd_HHmmss.txt 입니다.
 .PARAMETER NoReportFile
@@ -65,7 +65,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 $StartedAt = Get-Date
 # powershell -File 로 넘어온 "A,B" 형태의 경로 목록을 나누고, 따옴표 안 끝 역슬래시 때문에 남는 큰따옴표를 제거합니다.
 $NikkePath = @($NikkePath | ForEach-Object { ([string]$_) -split '\s*[,;]\s*' } | ForEach-Object { ([string]$_).Trim().TrimEnd('"').Trim() } | Where-Object { $_ })
@@ -173,7 +173,8 @@ function Add-Finding {
         if ($null -eq $e) { continue }
         $s = [string]$e
         # 증거 줄에 섞여 들어올 수 있는 비밀값(에이전트 비밀키, 로그인 토큰 등)은 가립니다.
-        $s = [regex]::Replace($s, '(?i)("(?:agent_pass|token|access_token|refresh_token|openid|password|passwd|secret|cookie|session|ticket)"\s*:\s*")[^"]*(")', '$1[생략]$2')
+        $s = [regex]::Replace($s, '(?i)("(?:agent_pass|token|access_token|refresh_token|openid|password|passwd|secret|cookie|session|ticket)"\s*:\s*")[^"]*("|$)', '$1[생략]$2')
+        $s = [regex]::Replace($s, '(?i)\b(agent_pass|token|access_token|refresh_token|openid|password|passwd|secret|cookie|session|ticket)=[^&\s"''<>]*', '$1=[생략]')
         if ($s.Length -gt 300) { $s = $s.Substring(0, 300) + ' ...' }
         if ($s.Trim().Length -eq 0) { continue }
         if (-not $ev.Contains($s)) { [void]$ev.Add($s) }
@@ -230,9 +231,10 @@ function Read-Bytes {
 function Scan-DebugLog([string]$Path) {
     # debug.log 를 한 줄씩 스트리밍으로 읽어 에이전트 흔적을 셉니다. 크기 제한 없음. 읽기 실패 시 $null.
     $r = @{
-        Lines = 0; K2f = 0; Runs = 0; Ins = 0; FirstTs = ''; LastTs = ''
+        Lines = 0; K2f = 0; Runs = 0; Agent = 0; Ins = 0; FirstTs = ''; LastTs = ''
         AgentLines = (New-Object System.Collections.ArrayList)
         RunTimes   = (New-Object System.Collections.ArrayList)
+        AgentTimes = (New-Object System.Collections.ArrayList)
     }
     try {
         $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $FileShareAll)
@@ -262,6 +264,13 @@ function Scan-DebugLog([string]$Path) {
                     }
                 }
                 if ($isIns) { $r.Ins++ }
+                if ($isCtx) {
+                    # k2f_chan 줄이 잘려 없어도 에이전트 고유의 시작 메시지가 있으면 실행으로 봅니다.
+                    if (($line.IndexOf('agent started as', $ci) -ge 0) -or ($line.IndexOf('lua downloaded to log', $ci) -ge 0) -or [regex]::IsMatch($line, '(?i)"(adopted|resuming) [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')) {
+                        $r.Agent++
+                        if ($line.IndexOf('agent started as', $ci) -ge 0) { $ts = Get-LogTimestamp $line; if ($ts) { [void]$r.AgentTimes.Add($ts) } }
+                    }
+                }
                 if ($r.AgentLines.Count -lt 60) { [void]$r.AgentLines.Add($line) }
             }
             if ($lastLine) { $r.LastTs = Get-LogTimestamp $lastLine }
@@ -270,6 +279,16 @@ function Scan-DebugLog([string]$Path) {
         } finally { $fs.Dispose() }
     } catch { $script:Stats.Errors++; return $null }
     return $r
+}
+
+function Test-SelfFile($f) {
+    # 이 도구의 보고서(NIKKE_점검결과_*.txt)와 점검 스크립트(.ps1)에는 지표 문자열이 들어 있으므로 내용을 검사하지 않습니다.
+    if ($f.Name -match '^(?i)NIKKE_점검결과_.*\.txt$' -or $f.Extension -ieq '.ps1') {
+        $n = ("점검 보고서/스크립트 파일은 내용을 검사하지 않았습니다: {0}" -f $f.FullName)
+        if (-not $script:Notes.Contains($n)) { [void]$script:Notes.Add($n) }
+        return $true
+    }
+    return $false
 }
 
 function Test-Contains([string]$Text, [string]$Needle) {
@@ -340,7 +359,7 @@ function Get-FilesUnder {
             if ($depth -lt $MaxDepth) {
                 foreach ($d in $di.GetDirectories()) {
                     if (($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-                    $queue.Enqueue(@($d.FullName, $depth + 1))
+                    $queue.Enqueue(@($d.FullName, ($depth + 1)))
                 }
             }
         } catch { $script:Stats.Errors++ }
@@ -410,10 +429,21 @@ function Find-Installs {
     Write-Step '[2/8] NIKKE 설치 폴더를 찾는 중...'
     foreach ($p in $NikkePath) {
         $r = Resolve-Install $p
-        if ($null -eq $r) {
+        if ($null -ne $r) { Add-Install $r; continue }
+        # 설치 폴더의 한두 단계 위(예: D:\Games)를 지정한 경우 그 아래도 찾아봅니다.
+        $before = $script:InstallsFound.Count
+        if (Test-Dir $p) {
+            try {
+                foreach ($c1 in (Get-ChildItem -LiteralPath $p -Directory -Force -ErrorAction SilentlyContinue)) {
+                    Add-Install $c1.FullName
+                    foreach ($c2 in (Get-ChildItem -LiteralPath $c1.FullName -Directory -Force -ErrorAction SilentlyContinue)) { Add-Install $c2.FullName }
+                }
+            } catch { }
+        }
+        if ($script:InstallsFound.Count -eq $before) {
             Add-Finding -Severity INFO -Title '지정한 경로에서 NIKKE 런처를 찾지 못함' `
-                -Detail 'Launcher\nikke_launcher.exe 또는 Launcher\intl_service\debug.log 가 있는 폴더를 지정하세요.' -Path $p
-        } else { Add-Install $r }
+                -Detail 'Launcher\nikke_launcher.exe 또는 Launcher\intl_service\debug.log 가 있는 폴더(또는 그 1~2단계 위 폴더)를 지정하세요.' -Path $p
+        }
     }
 
     if ($doSystemChecks) {
@@ -505,7 +535,7 @@ function Find-Installs {
                         if (($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
                         if ($depth -eq 0 -and ($skipNames -contains $d.Name)) { continue }
                         if ($d.Name -in @('node_modules', '.git', 'Windows', 'WinSxS')) { continue }
-                        $queue.Enqueue(@($d.FullName, $depth + 1))
+                        $queue.Enqueue(@($d.FullName, ($depth + 1)))
                     }
                 } catch { $script:Stats.Errors++ }
             }
@@ -529,7 +559,7 @@ function Find-Installs {
                             foreach ($d in $di.GetDirectories()) {
                                 if (($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
                                 if ($d.Name -in @('AppData', 'node_modules', '.git')) { continue }
-                                $queue.Enqueue(@($d.FullName, $depth + 1))
+                                $queue.Enqueue(@($d.FullName, ($depth + 1)))
                             }
                         } catch { }
                     }
@@ -570,11 +600,19 @@ function Check-Install([string]$InstallDir) {
                 -Detail '파일이 잠겨 있거나 읽기 권한이 없습니다. 런처를 완전히 종료한 뒤, 관리자 권한 PowerShell 에서 다시 실행하세요. 이 파일을 확인하지 못하면 판정이 불완전합니다.' -Path $dbg
         } else {
             $script:DebugLogsChecked++
-            if ($scan.K2f -gt 0) {
+            if ($scan.K2f -gt 0 -or $scan.Agent -gt 0) {
+                $times = $scan.RunTimes
+                if ($scan.Runs -eq 0) { $times = $scan.AgentTimes }
                 $timesText = ''
-                if ($scan.RunTimes.Count -gt 0) { $timesText = ' 에이전트 시작 시각(월-일 시:분:초, 연도는 로그에 없음): ' + (($scan.RunTimes | Select-Object -Unique | Select-Object -First 10) -join ', ') }
-                Add-Finding -Severity CRITICAL -Title '원격 제어 에이전트가 이 PC에서 실행된 기록 (debug.log 에 k2f_chan)' `
-                    -Detail ("debug.log 에 'k2f_chan registered' 가 {0}회 기록되어 있습니다. 런처가 켜져 있던 동안 공격자는 이 PC에서 임의 명령 실행, 파일 열람, 화면 캡처, 브라우저 저장 비밀번호·쿠키·토큰 수집을 할 수 있었습니다.{1}" -f $scan.Runs, $timesText) `
+                if ($times.Count -gt 0) { $timesText = ' 에이전트 시작 시각(월-일 시:분:초, 연도는 로그에 없음): ' + (($times | Select-Object -Unique | Select-Object -First 10) -join ', ') }
+                $what = ("'k2f_chan registered' 가 {0}회" -f $scan.Runs)
+                $title = '원격 제어 에이전트가 이 PC에서 실행된 기록 (debug.log 에 k2f_chan)'
+                if ($scan.K2f -eq 0) {
+                    $what = ("'agent started as' / 'adopted' / 'resuming' / 'lua downloaded to' 줄이 {0}회 (k2f_chan 줄은 없음)" -f $scan.Agent)
+                    $title = '원격 제어 에이전트가 이 PC에서 실행된 기록 (debug.log 에 agent started as / adopted / resuming / lua downloaded to)'
+                }
+                Add-Finding -Severity CRITICAL -Title $title `
+                    -Detail ("debug.log 에 {0} 기록되어 있습니다. 런처가 켜져 있던 동안 공격자는 이 PC에서 임의 명령 실행, 파일 열람, 화면 캡처, 브라우저 저장 비밀번호·쿠키·토큰 수집을 할 수 있었습니다.{1}" -f $what, $timesText) `
                     -Path $dbg -Evidence @($scan.AgentLines)
             } elseif ($scan.Ins -gt 0) {
                 Add-Finding -Severity WARNING -Title 'debug.log 에 로더 주소(insightjs) 언급, 에이전트 실행 기록은 없음' `
@@ -599,6 +637,7 @@ function Check-Install([string]$InstallDir) {
     if (Test-Dir $logDir) {
         $files = Get-FilesUnder -Root $logDir -MaxDepth 8
         foreach ($f in $files) {
+            if (Test-SelfFile $f) { continue }
             if ($f.Name -match '^(?i)k2f') {
                 Add-Finding -Severity CRITICAL -Title '런처 log 폴더에 k2f 파일' -Detail '에이전트가 저장한 파일 이름 패턴입니다. (초기 실행에서는 log\tinyget\k2f.lua 로 저장됨)' -Path $f.FullName -Evidence @("{0} 바이트, 수정 {1}" -f $f.Length, $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))
             }
@@ -613,16 +652,27 @@ function Check-Install([string]$InstallDir) {
             $text = $Latin1.GetString($bytes)
             $etagHits = @()
             foreach ($pe in $IOC.PayloadEtags) { if (Test-Contains $text $pe) { $etagHits += $pe } }
+            # 알려지지 않은 새 빌드라도 nginx ETag 의 크기 부분(3214f = 205,135 바이트)이 같으면 같은 에이전트로 봅니다.
+            foreach ($m in [regex]::Matches($text, '(?i)"[0-9a-f]{8}-3214f"')) { $v = $m.Value.Trim('"'); if ($etagHits -notcontains $v) { $etagHits += $v } }
             if (Test-Contains $text 'insight.bundle') {
                 $ev = @(Get-Snippets -Text $text -Needles @('insight.bundle') -Max 2)
-                $ev += @(Get-Snippets -Text $text -Needles @('result=', 'total=', 'perform success', 'fail') -Max 2)
+                # 같은 다운로드 작업(task_id)의 결과 줄만 인용합니다 (관련 없는 다운로드 줄이 섞이지 않게).
+                $ids = @()
+                foreach ($m in [regex]::Matches($text, '(?i)[^\r\n]*insight\.bundle[^\r\n]*')) {
+                    $mm = [regex]::Match($m.Value, '(?i)task_id=(\d+)')
+                    if ($mm.Success -and ($ids -notcontains $mm.Groups[1].Value)) { $ids += $mm.Groups[1].Value }
+                }
+                $needles = @()
+                foreach ($id in $ids) { $needles += ('task_id=' + $id) }
+                if ($needles.Count -eq 0) { $needles = @('total=205135', 'perform success') }
+                $ev += @(Get-Snippets -Text $text -Needles $needles -Max 3)
                 $ev += @(Get-Snippets -Text $text -Needles @('Last-Modified', 'ETag') -Max 1)
                 Add-Finding -Severity CRITICAL -Title '런처가 에이전트(insight.bundle) 다운로드를 요청한 기록' `
                     -Detail 'analytics.insightjs.com 에서 원격 제어 에이전트(insight.bundle)를 내려받으려 했습니다. 이 요청은 공격자 스크립트(l.js)가 런처 안에서 실행되고 서버가 다운로드를 지시했을 때만 생기므로 에이전트 단계에 도달한 것입니다. 증거의 result/total 값으로 성공 여부를 볼 수 있습니다(total=205135 이면 완료). Last-Modified/ETag 가 있으면 어떤 빌드였는지 알 수 있습니다.' `
                     -Path $f.FullName -Evidence $ev
             } elseif ($etagHits.Count -gt 0) {
                 Add-Finding -Severity CRITICAL -Title '런처 다운로드 로그에 에이전트(insight.bundle) 응답 헤더' `
-                    -Detail ("알려진 에이전트 빌드의 ETag({0})가 기록되어 있습니다. 런처가 에이전트를 내려받았습니다. (tinyget.mem.log 는 실행마다 처음부터 덮어쓰는 고정 크기 버퍼라 끝부분에 이전 세션의 헤더가 남을 수 있습니다)" -f ($etagHits -join ', ')) `
+                    -Detail ("에이전트(insight.bundle) 응답의 ETag({0})가 기록되어 있습니다(뒷부분 3214f = 205,135 바이트. 알려진 빌드는 6ae78037, 6ae8ccff, 6ae90538, 6ae9f628 으로 시작하며 그 외는 새 빌드일 수 있음). 런처가 에이전트를 내려받았습니다. (tinyget.mem.log 는 실행마다 처음부터 덮어쓰는 고정 크기 버퍼라 끝부분에 이전 세션의 헤더가 남을 수 있습니다)" -f ($etagHits -join ', ')) `
                     -Path $f.FullName -Evidence @(Get-Snippets -Text $text -Needles @('ETag', 'Last-Modified', 'Content-Length') -Max 4)
             } elseif (Test-Contains $text 'insightjs') {
                 Add-Finding -Severity WARNING -Title '런처 로그에 로더 주소(insightjs) 언급, 에이전트 다운로드 기록은 없음' `
@@ -650,10 +700,12 @@ function Check-LauncherData([string]$DataDir, [string]$Owner) {
     $skippedBefore = $script:Stats.Skipped
     $hasTbsCache = Test-Dir (Join-Path $DataDir 'tbs_cache')
     $analytics = $false
+    $cacheCom  = $false
     $agentHits = New-Object System.Collections.ArrayList
     $cacheHits = New-Object System.Collections.ArrayList
     $netHits   = New-Object System.Collections.ArrayList
     $otherHits = New-Object System.Collections.ArrayList
+    $mentionHits = New-Object System.Collections.ArrayList
     $loaders   = New-Object System.Collections.ArrayList
     $modEtag   = New-Object System.Collections.ArrayList
     $fixedEtag = New-Object System.Collections.ArrayList
@@ -662,6 +714,7 @@ function Check-LauncherData([string]$DataDir, [string]$Owner) {
     $netNames = @('Network Persistent State', 'TransportSecurity', 'Reporting and NEL')
 
     foreach ($f in $files) {
+        if (Test-SelfFile $f) { continue }
         $bytes = Read-Bytes -Path $f.FullName
         if ($null -eq $bytes) { continue }
         $checked++
@@ -687,8 +740,11 @@ function Check-LauncherData([string]$DataDir, [string]$Owner) {
             $s = @(Get-Snippets -Text $text -Needles @('insightjs') -Max 1)
             $line = ''
             if ($s.Count -gt 0) { $line = $s[0] }
+            # 주소 형태(insightjs.com/..., insightjs.org/...)인지, 글자로만 들어 있는지(공지문 본문 등) 구분합니다.
+            $isUrl = ($text -match '(?i)(^|[^a-z0-9.-])(www\.|analytics\.)?insightjs\.(com|org)(/|:\d)')
             if ($f.Name -in $netNames) { [void]$netHits.Add("$rel : $line") }
-            elseif ($inCodeCache -or $inHttpCache) { [void]$cacheHits.Add("$rel : $line") }
+            elseif (($inCodeCache -or $inHttpCache) -and $isUrl) { [void]$cacheHits.Add("$rel : $line"); if ($text -match '(?i)insightjs\.com(/|:\d)') { $cacheCom = $true } }
+            elseif (-not $isUrl) { [void]$mentionHits.Add("$rel : $line") }
             else { [void]$otherHits.Add("$rel : $line") }
             # 어떤 변조 파일의 로더가 실행됐는지 (l.js?f=aegis 등)
             foreach ($m in [regex]::Matches($text, '(?i)l\.js\?f=([a-z]+)')) {
@@ -715,16 +771,26 @@ function Check-LauncherData([string]$DataDir, [string]$Owner) {
     if ($cacheHits.Count -gt 0) {
         $ld = ''
         if ($loaders.Count -gt 0) { $ld = ' 확인된 로더: ' + (($loaders | Select-Object -Unique) -join ', ') + '.' }
-        Add-Finding -Severity WARNING -Title '런처 내장 브라우저 캐시에 insightjs.com 로더 주소' `
-            -Detail (("변조된 공식 파일이 불러온 악성 스크립트(insightjs.com/l.js)가 런처 안에서 실행됐습니다.{0} 이것만으로 에이전트가 내려받아졌다고 볼 수는 없습니다. 런처를 다시 켜기 전에 tbs_cache 폴더를 지워야 합니다." -f $ld) + $agentNote) `
-            -Path $DataDir -Evidence @($cacheHits)
+        if ($cacheCom) {
+            Add-Finding -Severity WARNING -Title '런처 내장 브라우저 캐시에 insightjs.com 로더 주소' `
+                -Detail (("변조된 공식 파일이 불러온 공격자 스크립트(insightjs.com/l.js)가 런처 안에서 실행됐습니다.{0} 이것만으로 에이전트까지 내려받았다고 볼 수는 없습니다. 런처를 다시 켜기 전에 tbs_cache 폴더를 지워야 합니다." -f $ld) + $agentNote) `
+                -Path $DataDir -Evidence @($cacheHits)
+        } else {
+            Add-Finding -Severity WARNING -Title '런처 내장 브라우저 캐시에 insightjs.org(경고 페이지) 주소 - 변조된 공식 파일이 11월 3일 이후에도 로드됨' `
+                -Detail (("변조된 공식 파일이 런처 안에서 실행되어 공격자 서버(insightjs.com) 대신 예비 주소 insightjs.org 를 불렀습니다.{0} insightjs.org 는 2026-11-03 이후 제3자가 등록해 경고 페이지만 띄우는 도메인이므로, 이 항목은 공격자 스크립트가 실행됐다는 증거가 아니라 런처가 그 이후에도 변조된 파일(캐시 또는 아직 교체되지 않은 CDN 서버의 사본)을 불러왔다는 뜻입니다. 런처를 다시 켜기 전에 tbs_cache 폴더를 지워야 합니다." -f $ld)) `
+                -Path $DataDir -Evidence @($cacheHits)
+        }
     }
     if ($netHits.Count -gt 0) {
         Add-Finding -Severity WARNING -Title '런처가 insightjs.com 에 접속한 네트워크 상태 기록' `
             -Detail ('런처 내장 브라우저가 공격자 도메인에 연결한 기록입니다.' + $agentNote) -Path $DataDir -Evidence @($netHits)
     }
     if ($otherHits.Count -gt 0) {
-        Add-Finding -Severity WARNING -Title '런처 데이터에 insightjs.com 언급' -Detail ('공격자 도메인이 런처 데이터 파일에 남아 있습니다.' + $agentNote) -Path $DataDir -Evidence @($otherHits)
+        Add-Finding -Severity WARNING -Title '런처 데이터에 insightjs.com 주소 기록' -Detail ('공격자 도메인 주소가 런처 데이터 파일에 남아 있습니다.' + $agentNote) -Path $DataDir -Evidence @($otherHits)
+    }
+    if ($mentionHits.Count -gt 0) {
+        Add-Finding -Severity INFO -Title '런처 데이터에 insightjs 라는 글자만 있음 (로더 주소 아님)' `
+            -Detail '캐시된 페이지나 스크립트 본문에 공격자 도메인 이름이 글자로만 들어 있습니다(예: 공지문). 로더 주소(insightjs.com/l.js)나 접속 기록이 아니므로 노출 흔적으로 보지 않습니다.' -Path $DataDir -Evidence @($mentionHits)
     }
     if ($modEtag.Count -gt 0) {
         Add-Finding -Severity WARNING -Title '런처 HTTP 캐시에 변조된 공식 파일 사본' `
@@ -738,7 +804,7 @@ function Check-LauncherData([string]$DataDir, [string]$Owner) {
         Add-Finding -Severity INFO -Title '런처 HTTP 캐시에 변조되지 않은(공격 이전 원본) 파일 사본' `
             -Detail '변조되지 않은 사본입니다. 다만 일부 CDN 서버는 공격 기간에도 이 사본을 제공했으므로, 이것만으로 언제 런처를 켰는지는 알 수 없습니다.' -Path $DataDir -Evidence @($preEtag | Select-Object -Unique)
     }
-    if ($agentHits.Count -eq 0 -and $cacheHits.Count -eq 0 -and $netHits.Count -eq 0 -and $otherHits.Count -eq 0 -and $modEtag.Count -eq 0) {
+    if ($agentHits.Count -eq 0 -and $cacheHits.Count -eq 0 -and $netHits.Count -eq 0 -and $otherHits.Count -eq 0 -and $modEtag.Count -eq 0 -and $mentionHits.Count -eq 0) {
         if (-not $hasTbsCache) {
             Add-Finding -Severity INFO -Title '런처 데이터에 tbs_cache 폴더가 없어 Local Storage/캐시 흔적은 확인할 수 없음' `
                 -Detail ("{0}개 파일 확인. k2f.agent.state 와 로더 캐시는 tbs_cache 안에 저장되므로, 이미 지웠다면 그 흔적도 함께 사라진 것입니다. debug.log 결과를 기준으로 판단하세요." -f $checked) -Path $DataDir
@@ -769,13 +835,13 @@ function Check-ChromeHelper([string]$LocalAppData, [string]$AppData, [string]$Ow
         $peh = Join-Path $r[1] 'PlatformExperienceHelper'
         if (-not (Test-Dir $peh)) { continue }
         $all = @(Get-ChildItem -LiteralPath $peh -Recurse -Force -Depth 4 -ErrorAction SilentlyContinue)
-        $dlls = @($all | Where-Object { -not $_.PSIsContainer -and $_.Name -ieq $IOC.DllName })
+        $dlls = @($all | Where-Object { -not $_.PSIsContainer -and ($_.Name -ieq $IOC.DllName -or $_.Name -ieq 'platform_experience_helper.dll.old') })
         $hexDirs = @(Get-ChildItem -LiteralPath $peh -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[0-9a-fA-F]{64}$' })
         if ($dlls.Count -gt 0) {
             $ev = @()
             foreach ($d in $dlls) { $ev += ("{0} ({1:N0} 바이트, 수정 {2})" -f $d.FullName, $d.Length, $d.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) }
             Add-Finding -Severity CRITICAL -Title "$browser 지속성 DLL 발견$tag" `
-                -Detail '공격자가 브라우저가 불러오도록 등록한 DLL 입니다. 런처를 꺼도 계속 동작하며 웹페이지에 입력하는 비밀번호와 지갑 복구 문구를 읽는다고 보고됐습니다. 레지스트리 키 삭제 -> 재부팅 -> 이 하위 폴더 삭제 순서로 제거하세요. (Defender 가 탐지하지 못한 사례가 있습니다)' `
+                -Detail '공격자가 브라우저 시작 때 함께 로드되도록 레지스트리에 등록한 DLL 입니다. 런처를 꺼도 계속 동작하며 웹페이지에 입력하는 비밀번호와 지갑 복구 문구를 읽는다고 보고됐습니다. 레지스트리 키 삭제 -> 재부팅 -> 아래 증거에 적힌 DLL 이 든 64자리 이름의 하위 폴더만 삭제(PlatformExperienceHelper 폴더 자체와 그 안의 .exe 는 지우지 마세요) 순서로 제거하세요. 자세한 순서는 "해야 할 일" 6번. (Windows Defender 가 탐지하지 못한 사례가 있습니다)' `
                 -Path $peh -Evidence $ev
         } elseif ($hexDirs.Count -gt 0) {
             $ev = @()
@@ -921,7 +987,7 @@ function Check-Processes {
         if ($launcherProcs.Count -gt 0) {
             $script:LauncherRunning = $true
             Add-Finding -Severity WARNING -Title 'NIKKE 런처가 지금 실행 중 - 먼저 종료하세요' `
-                -Detail '에이전트는 런처(내장 브라우저)가 켜져 있는 동안만 동작하고 공격자 서버와 통신합니다. 또 런처 캐시에 남은 변조 파일이 다시 로더를 부를 수 있습니다. 작업 관리자(Ctrl+Shift+Esc)에서 nikke_launcher.exe 를 끝낸 뒤 다시 점검하세요. 실행 중이라는 사실 자체가 감염 증거는 아닙니다.' -Evidence $launcherProcs
+                -Detail '에이전트 본체는 런처(내장 브라우저)가 켜져 있는 동안만 동작하고 공격자 서버와 통신합니다(브라우저 지속성 DLL 은 예외). 또 런처 캐시에 남은 변조 파일이 다시 로더를 부를 수 있습니다. 작업 관리자(Ctrl+Shift+Esc)에서 nikke_launcher.exe 를 끝낸 뒤 다시 점검하세요. 실행 중이라는 사실 자체가 감염 증거는 아닙니다.' -Evidence $launcherProcs
         } else {
             Add-Finding -Severity INFO -Title 'NIKKE 런처 실행 중 아님' -Detail 'nikke_launcher 프로세스가 없습니다.'
         }
@@ -942,7 +1008,8 @@ function Check-Processes {
     # 에이전트의 제어 채널(k2f_chan)은 명명 파이프로 보고됨. 열려 있으면 지금 동작 중.
     try {
         $pipes = @([System.IO.Directory]::GetFiles('\\.\pipe\'))
-        $k2fPipes = @($pipes | Where-Object { $_ -match '(?i)k2f' })
+        # 파이프 이름의 마지막 부분이 k2f 로 시작하거나 k2f_chan 을 포함하는 것만 (다른 프로그램 파이프 이름에 우연히 k2f 가 들어가는 경우 제외)
+        $k2fPipes = @($pipes | Where-Object { $_ -match '(?i)\\k2f[^\\]*$|k2f_chan' })
         if ($k2fPipes.Count -gt 0) {
             Add-Finding -Severity CRITICAL -Title '에이전트의 제어 채널(k2f 명명 파이프)이 지금 열려 있음' `
                 -Detail '에이전트가 현재 이 PC에서 동작하고 있습니다. 즉시 인터넷 연결을 끊고 런처(nikke_launcher.exe, tbs_browser.exe)를 종료하세요.' -Evidence $k2fPipes
@@ -1048,11 +1115,11 @@ function Check-Network {
     $ev = @()
     $missing = @()
     foreach ($d in $IOC.Domains) {
-        if ($blocked[$d]) { $ev += "$d : 차단됨" } else { $ev += "$d : 차단 안 됨"; $missing += "0.0.0.0 $d" }
+        if ($blocked[$d]) { $ev += "$d : 차단됨" } else { $ev += "$d : 차단 안 됨  (추가할 줄: 0.0.0.0 $d)"; $missing += "0.0.0.0 $d" }
     }
     $detail = 'hosts 파일로 공격자 도메인을 막아두면 남아 있는 캐시나 아직 교체되지 않은 CDN 서버의 변조 파일이 다시 로더를 불러도 연결이 되지 않습니다. 이 항목은 감염 여부가 아닌 보호 상태입니다.'
     if ($hostsNote) { $detail = $hostsNote + ' ' + $detail }
-    if ($missing.Count -gt 0) { $detail += ' 관리자 권한 메모장으로 hosts 파일 끝에 다음 줄을 추가하세요: ' + ($missing -join ' / ') + ' . IP 89.127.233.127 과 89.126.250.172 는 hosts 로 막을 수 없으니 방화벽에서 차단하세요.' }
+    if ($missing.Count -gt 0) { $detail += ' 관리자 권한 메모장으로 아래 "경로" 의 hosts 파일을 열어(파일 형식 "모든 파일") 맨 아래에 "추가할 줄" 을 한 줄씩 추가하세요. IP 89.127.233.127 과 89.126.250.172 는 hosts 로 막을 수 없으니 방화벽에서 차단하세요. 방법은 "해야 할 일" 참고.' }
     Add-Finding -Severity INFO -Title '보호 상태: hosts 파일의 공격자 도메인 차단 여부' -Detail $detail -Path $hostsPath -Evidence $ev
 }
 
@@ -1122,15 +1189,22 @@ Find-DataDirs -AppData $AppData -Owner ''
 if ($AppDataOverride -and -not $LocalAppDataOverride) { $LocalAppData = Join-Parts (Split-Path -Path $AppDataOverride -Parent) @('Local') }
 
 $otherProfiles = @()
-if (Test-Dir $UsersRoot) {
-    $skipProfiles = @('Public', 'Default', 'Default User', 'All Users', 'desktop.ini')
-    $myProfileFull = ''
-    try { if ($UserProfile) { $myProfileFull = (Get-Item -LiteralPath $UserProfile -ErrorAction Stop).FullName } } catch { }
+$usersRoots = @()
+if ($UsersRoot) { $usersRoots += $UsersRoot }
+if ($onWindows -and $env:SystemDrive -and -not $UsersRootOverride) { $usersRoots += (Join-Path $env:SystemDrive 'Users') }   # 내 프로필이 다른 드라이브로 옮겨진 경우 대비
+$skipProfiles = @('Public', 'Default', 'Default User', 'All Users', 'desktop.ini')
+$myProfileFull = ''
+try { if ($UserProfile) { $myProfileFull = (Get-Item -LiteralPath $UserProfile -ErrorAction Stop).FullName } } catch { }
+$seenProfiles = @()
+foreach ($ur in @($usersRoots | Select-Object -Unique)) {
+    if (-not (Test-Dir $ur)) { continue }
     try {
-        foreach ($prof in (Get-ChildItem -LiteralPath $UsersRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+        foreach ($prof in (Get-ChildItem -LiteralPath $ur -Directory -Force -ErrorAction SilentlyContinue)) {
             if ($skipProfiles -contains $prof.Name) { continue }
             if ($myProfileFull -and ($prof.FullName -ieq $myProfileFull)) { continue }
-            if (($prof.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if ($seenProfiles -contains $prof.FullName.ToLowerInvariant()) { continue }
+            $seenProfiles += $prof.FullName.ToLowerInvariant()
+            # 다른 드라이브로 옮겨진 프로필(정션)도 고정 하위 경로만 보므로 그대로 확인합니다.
             $roam  = Join-Parts $prof.FullName @('AppData', 'Roaming')
             $local = Join-Parts $prof.FullName @('AppData', 'Local')
             if (-not (Test-Dir $roam) -and -not (Test-Dir $local)) { continue }
@@ -1199,7 +1273,7 @@ $foundNikke = ($script:InstallsFound.Count -gt 0) -or ($script:DataDirsFound.Cou
 if ($crit.Count -gt 0) {
     $verdict = 'INFECTED'; $exitCode = 2
     $verdictTitle = '감염 흔적 확인'
-    $verdictText  = '에이전트가 내려받아졌거나 실행됐거나, 지속성 흔적이 있거나, 런처가 현재 실행 중입니다. 런처가 켜져 있던 동안 공격자는 이 PC에서 명령을 실행할 수 있었습니다. 이 PC는 침해된 것으로 간주하세요.'
+    $verdictText  = '런처가 에이전트(공격자의 원격 제어 프로그램)를 내려받았거나 실행한 기록, 또는 런처를 꺼도 남는 지속성 설치(브라우저 DLL·레지스트리 키)의 흔적이 있습니다. 런처가 켜져 있던 동안 공격자는 이 PC에서 명령을 실행할 수 있었습니다. 이 PC는 침해된 것으로 간주하세요.'
 } elseif ($warn.Count -gt 0) {
     $verdict = 'EXPOSED'; $exitCode = 1
     $onlyRunning = ($script:LauncherRunning -and $warn.Count -eq 1)
@@ -1247,7 +1321,11 @@ L ("판정: {0}" -f $verdictTitle)
 L $verdictText
 if ($script:LauncherRunning) { L '!! NIKKE 런처가 지금 실행 중입니다. 먼저 종료하세요 (작업 관리자 -> nikke_launcher.exe 끝내기).' }
 if ($debugLogNote) { L $debugLogNote }
-if ($launchedAfterOct24 -and $verdict -ne 'INFECTED') { L ("참고: debug.log 마지막 수정이 {0} 이라 2026-10-24 이후에 런처를 실행한 기록이 있습니다. 에이전트는 10월 24일부터 일부 실행에서만 배포됐으므로, 흔적이 없어도 비밀번호 변경을 권합니다." -f $script:LauncherLastWrite.ToString('yyyy-MM-dd HH:mm')) }
+if ($launchedAfterOct24 -and $verdict -ne 'INFECTED') {
+    $after = '에이전트는 늦어도 10월 24일부터 일부 실행에서만 배포됐으므로, '
+    if ($verdict -eq 'EXPOSED') { $after += '에이전트 흔적이 없어도 감염된 것처럼 대응하세요 (해야 할 일 4번).' } else { $after += '흔적이 없어도 깨끗한 기기에서 NIKKE/Level Infinite 비밀번호는 바꿔 두세요 (해야 할 일 4번).' }
+    L ("참고: debug.log 마지막 수정이 {0} 이라 2026-10-24 이후에 런처를 실행한 기록이 있습니다. {1}" -f $script:LauncherLastWrite.ToString('yyyy-MM-dd HH:mm'), $after)
+}
 L ''
 L '확인한 위치:'
 if ($script:Locations.Count -eq 0) { L '  (없음)' }
@@ -1255,6 +1333,8 @@ foreach ($loc in $script:Locations) { L ("  {0}" -f $loc) }
 foreach ($n in $script:Notes) { L ("  * {0}" -f $n) }
 L ''
 L ("발견 사항: CRITICAL {0} / WARNING {1} / INFO {2}" -f $crit.Count, $warn.Count, $info.Count)
+L '  (CRITICAL = 에이전트 다운로드·실행 기록 또는 지속성 설치 흔적 -> 감염 / WARNING = 변조 파일·공격자 스크립트 로드 흔적 또는 런처 실행 중 -> 노출 / INFO = 참고 정보, 판정에 영향 없음)'
+L '  용어: 로더 = 변조된 공식 파일이 불러오는 공격자 스크립트(insightjs.com/l.js) / 에이전트 = 로더가 내려받아 런처 안에서 실행하는 원격 제어 프로그램(insight.bundle) / 지속성 = 런처를 꺼도 계속 동작하도록 심어 둔 브라우저 DLL 과 레지스트리 키'
 L '----------------------------------------------------------------------'
 foreach ($f in @($crit + $warn + $info)) {
     L ("[{0}] {1}" -f $f.Severity, $f.Title)
@@ -1270,9 +1350,21 @@ switch ($verdict) {
         L ' 1. 지금 NIKKE 런처를 끄고 이 PC의 인터넷 연결을 끊으세요. (작업 관리자에서 nikke_launcher.exe 종료)'
         L ' 2. Level Infinite 가 수정 완료를 공식 발표하기 전까지 런처를 다시 켜지 마세요.'
         L ' 3. 이 보고서 파일을 먼저 보관하세요. tbs_cache 를 지우면 k2f.agent.state 흔적도 함께 사라집니다.'
-        L ' 4. 런처를 다시 켜기 전에 %APPDATA%\nikke_launcher\tbs_cache 폴더를 지우세요. (변조 파일이 캐시에 남아 있을 수 있음)'
-        L ' 5. hosts 파일에 insightjs.com / www.insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 과 89.126.250.172 를 차단하세요.'
-        L ' 6. "Chrome 지속성 DLL" 또는 "레지스트리 지속성" 이 발견됐다면: HKCU\Software\Classes\CLSID\{E77CC89B-7401-4C04-8CED-149DB35ADD04} 삭제 -> 재부팅 -> PlatformExperienceHelper 아래 64자리 16진수 폴더 삭제. (HKLM 의 같은 CLSID 는 Windows 정상 항목이니 건드리지 마세요)'
+        L ' 4. 런처를 다시 켜기 전에 위 "확인한 위치" 의 [런처 데이터] 폴더마다 그 안의 tbs_cache 폴더를 지우세요. 보통 %APPDATA%\nikke_launcher\tbs_cache 이며, 탐색기 주소창에 %APPDATA%\nikke_launcher 를 붙여 넣으면 열립니다. (변조 파일이 캐시에 남아 있을 수 있음. 다른 사용자 계정의 [런처 데이터] 폴더는 그 계정으로 로그인해 지우세요)'
+        L ' 5. 공격자 도메인과 IP 차단: 시작 메뉴에서 "메모장" 을 찾아 관리자 권한으로 실행 -> 파일 열기에서 파일 형식을 "모든 파일" 로 바꾸고 C:\Windows\System32\drivers\etc\hosts 를 열어 맨 아래에 다음 4줄을 추가하고 저장하세요:'
+        L '         0.0.0.0 insightjs.com'
+        L '         0.0.0.0 www.insightjs.com'
+        L '         0.0.0.0 analytics.insightjs.com'
+        L '         0.0.0.0 insightjs.org'
+        L '    IP 는 hosts 로 막을 수 없으니 관리자 권한 PowerShell 에서 다음 한 줄을 실행하세요(또는 공유기/방화벽에서 두 IP 차단): New-NetFirewallRule -DisplayName "Block insightjs" -Direction Outbound -RemoteAddress 89.127.233.127,89.126.250.172 -Action Block'
+        L ' 6. 위에 "지속성 DLL", "64자리 16진수 폴더", "레지스트리 지속성" 또는 "CLSID" 항목이 있다면 반드시 이 순서로 제거하세요 (보고서를 먼저 저장):'
+        L '    1) 레지스트리 키 삭제: 감염된 사용자 계정으로 로그인한 상태에서 시작 메뉴 -> cmd(명령 프롬프트)를 열고 다음 두 줄을 각각 실행하세요. (관리자 권한 불필요. 기본값이 비어 있어도 지우세요. "지정된 레지스트리 키를 찾을 수 없습니다" 가 나오면 그 키는 원래 없는 것이니 무시)'
+        L '         reg delete "HKCU\Software\Classes\CLSID\{E77CC89B-7401-4C04-8CED-149DB35ADD04}" /f'
+        L '         reg delete "HKCU\Software\Classes\WOW6432Node\CLSID\{E77CC89B-7401-4C04-8CED-149DB35ADD04}" /f'
+        L '       HKLM(HKEY_LOCAL_MACHINE) 아래의 같은 CLSID 는 Windows 정상 항목(wpc.dll)이니 절대 건드리지 마세요.'
+        L '    2) Windows 를 재부팅하세요. DLL 은 로드된 동안 잠겨 있어 재부팅 전에는 지워지지 않습니다.'
+        L '    3) 위 "지속성 DLL" 항목의 "경로" 폴더(보통 %LOCALAPPDATA%\Google\Chrome\User Data\PlatformExperienceHelper, 탐색기 주소창에 붙여 넣으면 열림)에서 platform_experience_helper.dll 이 든 64자리 영문·숫자 이름의 하위 폴더만 지우세요. PlatformExperienceHelper 폴더 자체와 그 안의 platform_experience_helper.exe, LoadFeatures 는 Chrome 의 정상 파일이니 두세요.'
+        L '    4) 이 스크립트를 다시 실행해 두 항목이 사라졌는지 확인하세요. Windows Defender 가 이 DLL 을 탐지하지 못한 사례가 있으므로 백신 검사가 깨끗하다고 해서 제거된 것은 아닙니다.'
         L ' 7. 가장 확실한 복구는 Windows 재설치입니다. 에이전트는 임의 명령을 실행할 수 있었고, 어떤 명령이 실행됐는지 로그에 남지 않습니다.'
         L ' 8. 깨끗한 기기(스마트폰 등)에서 비밀번호를 바꾸세요: NIKKE/Level Infinite -> 이메일 -> Discord -> 금융 -> 브라우저에 저장된 모든 비밀번호. 2단계 인증을 켜세요.'
         L ' 9. Google, Discord, Steam, GitHub 등 모든 서비스에서 "모든 세션 로그아웃" 을 하세요. 훔친 쿠키는 비밀번호 없이도 쓸 수 있습니다.'
@@ -1281,20 +1373,39 @@ switch ($verdict) {
     }
     'EXPOSED' {
         L ' 1. Level Infinite 가 수정 완료를 공식 발표하기 전까지 런처를 켜지 마세요.'
-        L ' 2. 런처를 다시 켜기 전에 %APPDATA%\nikke_launcher\tbs_cache 폴더를 지우세요. (변조 파일이 캐시에 남아 있을 수 있음)'
-        L ' 3. hosts 파일에 insightjs.com / www.insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 과 89.126.250.172 를 차단하세요.'
-        L ' 4. 에이전트는 2026-10-24 부터 일부 실행에서만 배포됐습니다. 그 이후에 런처를 켠 적이 있다면 감염된 것처럼 대응하세요: 깨끗한 기기에서 비밀번호 변경(NIKKE -> 이메일 -> Discord -> 금융 -> 브라우저 저장 비밀번호), 모든 세션 로그아웃, API 토큰·SSH 키 폐기, 암호화폐는 새 지갑으로 이동.'
+        L ' 2. 런처를 다시 켜기 전에 위 "확인한 위치" 의 [런처 데이터] 폴더마다 그 안의 tbs_cache 폴더를 지우세요. 보통 %APPDATA%\nikke_launcher\tbs_cache 이며, 탐색기 주소창에 %APPDATA%\nikke_launcher 를 붙여 넣으면 열립니다. (변조 파일이 캐시에 남아 있을 수 있음)'
+        L ' 3. 공격자 도메인과 IP 차단: 시작 메뉴에서 "메모장" 을 찾아 관리자 권한으로 실행 -> 파일 열기에서 파일 형식을 "모든 파일" 로 바꾸고 C:\Windows\System32\drivers\etc\hosts 를 열어 맨 아래에 다음 4줄을 추가하고 저장하세요:'
+        L '         0.0.0.0 insightjs.com'
+        L '         0.0.0.0 www.insightjs.com'
+        L '         0.0.0.0 analytics.insightjs.com'
+        L '         0.0.0.0 insightjs.org'
+        L '    IP 는 hosts 로 막을 수 없으니 관리자 권한 PowerShell 에서 다음 한 줄을 실행하세요(또는 공유기/방화벽에서 두 IP 차단): New-NetFirewallRule -DisplayName "Block insightjs" -Direction Outbound -RemoteAddress 89.127.233.127,89.126.250.172 -Action Block'
+        if ($launchedAfterOct24) {
+            L ' 4. debug.log 에 따르면 2026-10-24 이후에 런처를 켠 기록이 있습니다. 에이전트는 늦어도 그날부터 일부 실행에서만 배포됐고 그 흔적은 지워질 수 있으므로, 감염된 것처럼 대응하세요: 깨끗한 기기(스마트폰 등)에서 비밀번호 변경(NIKKE/Level Infinite -> 이메일 -> Discord -> 금융 -> 브라우저 저장 비밀번호), 모든 서비스에서 "모든 세션 로그아웃", API 토큰·SSH 키 폐기, 암호화폐는 새 시드 구문의 지갑으로 이동.'
+        } else {
+            L ' 4. 에이전트는 늦어도 2026-10-24 부터 일부 실행에서만 배포됐습니다. 그 무렵 이후에 런처를 켠 적이 있다면 감염된 것처럼 대응하세요: 깨끗한 기기(스마트폰 등)에서 비밀번호 변경(NIKKE/Level Infinite -> 이메일 -> Discord -> 금융 -> 브라우저 저장 비밀번호), 모든 서비스에서 "모든 세션 로그아웃", API 토큰·SSH 키 폐기, 암호화폐는 새 시드 구문의 지갑으로 이동.'
+        }
     }
     'NO_TRACES' {
         L ' 1. Level Infinite 가 수정 완료를 공식 발표하기 전까지 런처를 켜지 마세요.'
-        L ' 2. 런처를 다시 켜기 전에 %APPDATA%\nikke_launcher\tbs_cache 폴더를 지우세요.'
-        L ' 3. hosts 파일에 insightjs.com / www.insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 과 89.126.250.172 를 차단하세요.'
-        L ' 4. 2026-10-24 이후에 런처를 켠 적이 있다면 깨끗한 기기에서 NIKKE/Level Infinite 비밀번호는 바꿔 두세요.'
+        L ' 2. 런처를 다시 켜기 전에 위 "확인한 위치" 의 [런처 데이터] 폴더마다 그 안의 tbs_cache 폴더를 지우세요. 보통 %APPDATA%\nikke_launcher\tbs_cache 이며, 탐색기 주소창에 %APPDATA%\nikke_launcher 를 붙여 넣으면 열립니다.'
+        L ' 3. 공격자 도메인과 IP 차단: 시작 메뉴에서 "메모장" 을 찾아 관리자 권한으로 실행 -> 파일 열기에서 파일 형식을 "모든 파일" 로 바꾸고 C:\Windows\System32\drivers\etc\hosts 를 열어 맨 아래에 다음 4줄을 추가하고 저장하세요:'
+        L '         0.0.0.0 insightjs.com'
+        L '         0.0.0.0 www.insightjs.com'
+        L '         0.0.0.0 analytics.insightjs.com'
+        L '         0.0.0.0 insightjs.org'
+        L '    IP 는 hosts 로 막을 수 없으니 관리자 권한 PowerShell 에서 다음 한 줄을 실행하세요(또는 공유기/방화벽에서 두 IP 차단): New-NetFirewallRule -DisplayName "Block insightjs" -Direction Outbound -RemoteAddress 89.127.233.127,89.126.250.172 -Action Block'
+        L ' 4. 에이전트는 늦어도 2026-10-24 부터 배포됐습니다. 그 무렵 이후에 런처를 켠 적이 있다면 깨끗한 기기(스마트폰 등)에서 NIKKE/Level Infinite 비밀번호는 바꿔 두세요.'
     }
     default {
         L ' 1. NIKKE 를 다른 곳에 설치했다면 -NikkePath "설치폴더" 를 지정하거나 -DeepScan 으로 다시 실행하세요.'
         L ' 2. Level Infinite 가 수정 완료를 공식 발표하기 전까지 런처를 켜지 마세요.'
-        L ' 3. hosts 파일에 insightjs.com / www.insightjs.com / analytics.insightjs.com / insightjs.org 를 0.0.0.0 으로 추가하고, 방화벽에서 89.127.233.127 과 89.126.250.172 를 차단하세요.'
+        L ' 3. 공격자 도메인과 IP 차단: 시작 메뉴에서 "메모장" 을 찾아 관리자 권한으로 실행 -> 파일 열기에서 파일 형식을 "모든 파일" 로 바꾸고 C:\Windows\System32\drivers\etc\hosts 를 열어 맨 아래에 다음 4줄을 추가하고 저장하세요:'
+        L '         0.0.0.0 insightjs.com'
+        L '         0.0.0.0 www.insightjs.com'
+        L '         0.0.0.0 analytics.insightjs.com'
+        L '         0.0.0.0 insightjs.org'
+        L '    IP 는 hosts 로 막을 수 없으니 관리자 권한 PowerShell 에서 다음 한 줄을 실행하세요(또는 공유기/방화벽에서 두 IP 차단): New-NetFirewallRule -DisplayName "Block insightjs" -Direction Outbound -RemoteAddress 89.127.233.127,89.126.250.172 -Action Block'
     }
 }
 L ''
@@ -1303,7 +1414,7 @@ L ' - debug.log 와 tinyget 로그는 NIKKE 폴더 안에 있어 NIKKE 를 지�
 L ' - 아무것도 찾지 못했다는 것이 PC가 깨끗하다는 증명은 아닙니다.'
 L ' - 에이전트가 실행한 명령은 로그에 남지 않으므로, 공격자가 무엇을 가져갔는지는 알 수 없습니다.'
 L ' - 전체 분석: https://gist.github.com/MotherSphere/d6c049a09ba8ac3085c51ee9df24a4e5'
-L ' - 공식 점검 도구(GUI, Windows/Linux/macOS): https://github.com/MotherSphere/NIKKE-Launcher-Check'
+L ' - 위 분석을 쓴 분석자(MotherSphere)의 점검 도구(GUI, Windows/Linux/macOS): https://github.com/MotherSphere/NIKKE-Launcher-Check'
 L ''
 L ("통계: 파일 {0:N0}개 ({1:N1} MB) 확인, 폴더 {2:N0}개, 건너뜀 {3}, 오류 {4}, 소요 {5:N1}초" -f $script:Stats.Files, ($script:Stats.Bytes / 1MB), $script:Stats.Dirs, $script:Stats.Skipped, $script:Stats.Errors, ((Get-Date) - $StartedAt).TotalSeconds)
 L '주의: 이 보고서에는 사용자 이름, 컴퓨터 이름, 파일 경로, 이 PC에 어떤 자격증명 파일이 있는지가 들어 있습니다. 공개 게시판에 올리지 말고, 도움을 받을 때는 믿을 수 있는 상대에게만 보내세요.'
@@ -1338,11 +1449,13 @@ if (-not $NoReportFile) {
         }
         # 상대 경로는 PowerShell 의 현재 위치 기준으로 풉니다 (.NET 은 프로세스 작업 폴더를 쓰므로 다를 수 있음).
         try { $ReportPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportPath) } catch { }
+        # 폴더를 지정했으면 그 안에 기본 이름으로 저장합니다.
+        if (Test-Dir $ReportPath) { $ReportPath = Join-Path $ReportPath ("NIKKE_점검결과_{0}.txt" -f $StartedAt.ToString('yyyyMMdd_HHmmss')) }
         $utf8bom = New-Object System.Text.UTF8Encoding($true)
         [System.IO.File]::WriteAllText($ReportPath, (($R -join "`r`n") + "`r`n"), $utf8bom)
         Write-Host ''
         Write-Host ("보고서 저장: {0}" -f $ReportPath) -ForegroundColor Green
-        Write-Host '이 파일 내용을 붙여넣으면 결과를 함께 해석할 수 있습니다. (사용자·컴퓨터 이름과 자격증명 파일 목록이 들어 있으니 공개 게시판에는 올리지 마세요)' -ForegroundColor DarkGray
+        Write-Host '도움을 요청할 때 이 파일 내용을 함께 보내면 결과를 해석받을 수 있습니다. (사용자·컴퓨터 이름과 자격증명 파일 목록이 들어 있으니 공개 게시판에는 올리지 마세요)' -ForegroundColor DarkGray
     } catch {
         Write-Host ("보고서 파일을 저장하지 못했습니다: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
     }
