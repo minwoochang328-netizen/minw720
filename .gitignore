@@ -1,0 +1,12 @@
+# 모델/중간산출물은 저장소에 넣지 않음
+*.gguf
+*.safetensors
+*.bin
+*.kld
+*.imatrix*
+models/
+calib/calibration_ko_en_code.txt
+calib/eval_holdout.txt
+__pycache__/
+*.pyc
+.venv/

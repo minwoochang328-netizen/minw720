@@ -1,0 +1,46 @@
+{
+  "_comment": "모델 구조 프리셋. verified=false 항목은 리서치/모델카드로 재검증 예정. 파라미터 단위: 10억(B). params_total = experts + ffn_dense + attn_other(계산됨) + embed + output",
+  "models": {
+    "gpt-oss-20b": {
+      "org": "OpenAI", "country": "US", "license": "Apache-2.0", "release": "2025-08-05", "verified": false,
+      "notes": "MoE 32 experts/top-4, 전문가 가중치 네이티브 MXFP4(QAT). 24층 중 12층은 sliding window 128. 어텐션 싱크. 추론 노력(low/medium/high) 선택.",
+      "n_layer": 24, "n_head_kv": 8, "head_dim": 64, "n_embd": 2880, "vocab": 201088, "tied_embeddings": false,
+      "n_swa_layer": 12, "swa_window": 128,
+      "params_total_b": 20.91, "params_active_b": 3.61,
+      "params_experts_b": 19.11, "params_experts_active_b": 2.39,
+      "params_ffn_dense_b": 0.0, "params_embed_b": 0.579, "params_output_b": 0.579
+    },
+    "llama-3.1-8b": {
+      "org": "Meta", "country": "US", "license": "Llama 3.1 Community", "release": "2024-07-23", "verified": true,
+      "notes": "밀집 8B, GQA 8 KV heads, 128K ctx. 라이선스: 월 7억 MAU 미만 상업 이용 가능, 'Built with Llama' 표기.",
+      "n_layer": 32, "n_head_kv": 8, "head_dim": 128, "n_embd": 4096, "vocab": 128256, "tied_embeddings": false,
+      "params_total_b": 8.03, "params_active_b": 8.03,
+      "params_experts_b": 0.0, "params_experts_active_b": 0.0,
+      "params_ffn_dense_b": 5.64, "params_embed_b": 0.525, "params_output_b": 0.525
+    },
+    "phi-4-14b": {
+      "org": "Microsoft", "country": "US", "license": "MIT", "release": "2024-12-12", "verified": false,
+      "notes": "밀집 14.7B, 16K ctx. 8GB 에는 ~3.3bpw(EXL3) 또는 IQ3_M + FFN 일부 CPU 오프로드 필요.",
+      "n_layer": 40, "n_head_kv": 10, "head_dim": 128, "n_embd": 5120, "vocab": 100352, "tied_embeddings": false,
+      "params_total_b": 14.66, "params_active_b": 14.66,
+      "params_experts_b": 0.0, "params_experts_active_b": 0.0,
+      "params_ffn_dense_b": 10.49, "params_embed_b": 0.514, "params_output_b": 0.514
+    },
+    "mistral-nemo-12b": {
+      "org": "Mistral AI / NVIDIA", "country": "FR/US", "license": "Apache-2.0", "release": "2024-07-18", "verified": false,
+      "notes": "밀집 12.2B, Tekken 토크나이저(131k), 128K ctx(실효 ~16-32K 권장).",
+      "n_layer": 40, "n_head_kv": 8, "head_dim": 128, "n_embd": 5120, "vocab": 131072, "tied_embeddings": false,
+      "params_total_b": 12.25, "params_active_b": 12.25,
+      "params_experts_b": 0.0, "params_experts_active_b": 0.0,
+      "params_ffn_dense_b": 8.6, "params_embed_b": 0.671, "params_output_b": 0.671
+    },
+    "bitnet-b1.58-2b-4t": {
+      "org": "Microsoft", "country": "US", "license": "MIT", "release": "2025-04-16", "verified": false,
+      "notes": "네이티브 1.58비트(삼진) 가중치, 2.4B, 4T 토큰 학습. bitnet.cpp CPU 추론 전용 성격. GGUF TQ1_0/TQ2_0 (i2_s).",
+      "n_layer": 30, "n_head_kv": 5, "head_dim": 128, "n_embd": 2560, "vocab": 128256, "tied_embeddings": true,
+      "params_total_b": 2.41, "params_active_b": 2.41,
+      "params_experts_b": 0.0, "params_experts_active_b": 0.0,
+      "params_ffn_dense_b": 1.6, "params_embed_b": 0.328, "params_output_b": 0.0
+    }
+  }
+}

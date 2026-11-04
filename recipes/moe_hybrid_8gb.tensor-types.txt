@@ -1,0 +1,16 @@
+# ── MoE 하이브리드(전문가=CPU, 나머지=GPU) 레시피 ────────────────────────────────
+# 라우터/게이트 확률 바이어스: 작고 민감 → 그대로 고정밀
+ffn_gate_inp=f16
+exp_probs_b=f16
+# 공유 전문가(있으면; Gemma4-MoE/Nemotron/Granite 등): 매 토큰 사용 → GPU 상주 가치 있음
+ffn_(gate|up|down)_shexp=q6_k
+# 어텐션(GPU 상주, 전체의 수 % 에 불과) → 사실상 무손실 8비트
+attn_(q|k|v|output|qkv|q_a|q_b|kv_a_mqa|kv_b|k_b|v_b)=q8_0
+# Mamba/SSM 계열(Nemotron 3 Nano, Granite 4 H) 투영: 작고 민감 → 8비트
+ssm_(in|out|x|dt|a|d|conv1d|norm)=q8_0
+# 전문가 down 투영은 up/gate 보다 민감 → 한 단계 높게
+ffn_down_exps=iq4_xs
+# 전문가 up/gate: RAM 대역폭이 속도를 결정하므로 4비트대 유지 (품질 여유가 있으면 mxfp4→iq4_xs→q4_k→q5_k 순으로 올림)
+ffn_(gate|up|gate_up)_exps=mxfp4
+# 밀집 FFN 레이어가 섞여 있으면(일부 아키텍처) 보호
+ffn_(gate|up|down)\.weight=q6_k
