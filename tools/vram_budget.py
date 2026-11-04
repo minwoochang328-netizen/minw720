@@ -111,6 +111,10 @@ class ModelSpec:
     # 슬라이딩 윈도우(로컬) 어텐션: 해당 레이어 수와 윈도우 크기 (Gemma, gpt-oss 등)
     n_swa_layer: int = 0
     swa_window: int = 0
+    # 레이어 종류별 K(또는 V) 차원 = n_head_kv × head_dim. 0 이면 n_head_kv*head_dim 사용.
+    # Gemma 4 처럼 글로벌(2×512)과 로컬(8×256) 레이어의 KV 구성이 다를 때 지정.
+    kv_dim_full: int = 0
+    kv_dim_swa: int = 0
     # SSM(Mamba) 고정 상태 크기 (시퀀스당, MiB) — 하이브리드 모델용
     ssm_state_mib: float = 0.0
 
@@ -146,7 +150,9 @@ class Hardware:
     # 9700X 는 CCD 1개 → Infinity Fabric 읽기 상한 ≈ 64 GB/s (32B/clk × FCLK 2.0GHz). DDR5-6000 의 96 GB/s 를 다 못 씀.
     # AIDA64 실측 ≈ 52 GB/s(stock). 듀얼 CCD(9900X/9950X)면 --ram-bw 90 정도로 올려서 계산.
     cpu_bw_gbs: float = 64.0
-    cpu_bw_eff: float = 0.85             # llama.cpp CPU MoE 디코드 실효 비율 → ≈ 54 GB/s
+    # llama.cpp CPU MoE 커널은 대역폭 상한의 ~60~75% 에 도달(실측 보고: 7945HX/DDR5 Gemma 4 26B-A4B 전문가 전부 CPU → 30 tok/s,
+    # 5900X/DDR4-3200 gpt-oss-20b 전문가 전부 CPU → 20 tok/s). 0.70 → ≈ 45 GB/s 실효.
+    cpu_bw_eff: float = 0.70
     os: str = "linux"                    # linux | windows
     per_token_overhead_ms: float = 1.5   # 커널 런치/동기화/CPU↔GPU 왕복 등 고정 비용(오프로드 시 증가)
 
@@ -208,10 +214,11 @@ class Budget:
 # ---------------------------------------------------------------------------
 # 3. 계산
 # ---------------------------------------------------------------------------
-def kv_bytes_per_token(m: ModelSpec, plan: Plan) -> float:
-    """풀 어텐션 레이어 1개, 토큰 1개당 K+V 바이트 (레이어 수 포함 전).
-    K 와 V 는 각각 n_head_kv × head_dim 원소."""
-    per_layer = m.n_head_kv * m.head_dim * (kv_bits_of(plan.kv_k) + kv_bits_of(plan.kv_v)) / 8.0
+def kv_bytes_per_token(m: ModelSpec, plan: Plan, swa: bool = False) -> float:
+    """어텐션 레이어 1개, 토큰 1개당 K+V 바이트 (레이어 수 포함 전).
+    K 와 V 는 각각 kv_dim(= n_head_kv × head_dim) 원소."""
+    dim = (m.kv_dim_swa if swa else m.kv_dim_full) or (m.n_head_kv * m.head_dim)
+    per_layer = dim * (kv_bits_of(plan.kv_k) + kv_bits_of(plan.kv_v)) / 8.0
     return per_layer
 
 
@@ -221,7 +228,7 @@ def kv_total_bytes(m: ModelSpec, plan: Plan) -> float:
     full = m.n_full_layer * ctx * per_layer_tok
     if m.n_swa_layer:
         swa_tokens = ctx if plan.swa_full else min(ctx, m.swa_window + plan.ubatch)  # llama.cpp SWA 캐시는 윈도우+ubatch 패딩
-        full += m.n_swa_layer * swa_tokens * per_layer_tok
+        full += m.n_swa_layer * swa_tokens * kv_bytes_per_token(m, plan, swa=True)
     full += m.ssm_state_mib * MiB * plan.n_parallel
     return full
 
@@ -244,8 +251,9 @@ def weights_split(m: ModelSpec, plan: Plan):
     frac_moe_cpu = min(1.0, plan.n_cpu_moe / n_layer) if m.params_experts_b else 0.0
     frac_ffn_cpu = min(1.0, plan.n_cpu_ffn / n_layer) if m.params_ffn_dense_b else 0.0
     cpu = experts * frac_moe_cpu + ffn * frac_ffn_cpu
-    # 입력 임베딩(token_embd)은 llama.cpp 에서 보통 CPU(호스트) 버퍼에 둔다 → GPU 에서 제외
-    gpu = file_bytes - cpu - emb
+    # 입력 임베딩(token_embd)은 llama.cpp 에서 보통 CPU(호스트) 버퍼에 둔다 → GPU 에서 제외.
+    # 단, 임베딩이 lm_head 와 공유(tied)되면 출력 계산용으로 GPU 에도 올라가므로 포함.
+    gpu = file_bytes - cpu - (0.0 if m.tied_embeddings else emb)
     return gpu, cpu, file_bytes, dict(experts=experts, ffn=ffn, attn=attn, emb=emb, out=out,
                                       frac_moe_cpu=frac_moe_cpu, frac_ffn_cpu=frac_ffn_cpu)
 
@@ -298,10 +306,11 @@ def estimate(m: ModelSpec, hw: Hardware, plan: Plan) -> Budget:
     active_experts_bytes = m.params_experts_active_b * B * b
     hit = plan.moe_cache_hit if moe_cache > 0 else 0.0
     cpu_bytes = active_experts_bytes * parts["frac_moe_cpu"] * (1 - hit) + m.params_ffn_dense_b * B * b * parts["frac_ffn_cpu"]
+    b_emb = bpw_of(plan.quant_embed) / 8.0 if plan.quant_embed else b
     gpu_bytes = (active_experts_bytes * (1 - parts["frac_moe_cpu"]) + active_experts_bytes * parts["frac_moe_cpu"] * hit
                  + m.params_ffn_dense_b * B * b * (1 - parts["frac_ffn_cpu"])
                  + m.params_attn_other_b * B * b_attn
-                 + m.params_output_b * B * b_out)
+                 + (m.params_embed_b * B * b_emb if m.tied_embeddings else m.params_output_b * B * b_out))
     # KV 읽기: 평균적으로 현재 컨텍스트의 절반 정도가 채워져 있다고 가정
     gpu_bytes += kv * 0.5
     t = gpu_bytes / (hw.gpu_bw_gbs * 1e9 * hw.gpu_bw_eff) + cpu_bytes / (hw.cpu_bw_gbs * 1e9 * hw.cpu_bw_eff)
@@ -376,7 +385,7 @@ def print_budget(b: Budget, m: ModelSpec, hw: Hardware) -> None:
     print(f"├─ 가중치 파일(전체)      {fmt_gib(b.file_size_gib)}")
     print(f"│  가중치 → GPU           {fmt_gib(b.weights_gpu_gib)}")
     print(f"│  가중치 → CPU(RAM)      {fmt_gib(b.weights_cpu_gib)}   (+ 입력 임베딩은 호스트 메모리)")
-    print(f"│  KV 캐시                {fmt_gib(b.kv_gib)}   (풀어텐션 {b.kv_bytes_per_token_full/1024:.1f} KiB/token × {p['ctx']:,})")
+    print(f"│  KV 캐시                {fmt_gib(b.kv_gib)}   (풀어텐션 레이어 합계 {b.kv_bytes_per_token_full/1024:.1f} KiB/token × {p['ctx']:,}; SWA 레이어는 윈도우 크기로 고정)")
     print(f"│  연산 버퍼(추정)        {fmt_gib(b.compute_buf_gib)}")
     print(f"│  CUDA 컨텍스트           {fmt_gib(b.cuda_ctx_gib)}")
     if b.extra_fixed_gib:
@@ -386,7 +395,7 @@ def print_budget(b: Budget, m: ModelSpec, hw: Hardware) -> None:
     print(f"├─ GPU 합계              {fmt_gib(b.gpu_total_gib)}  /  예산 {fmt_gib(b.gpu_budget_gib)} (VRAM − OS 예약 {b.os_reserve_gib:.2f})")
     verdict = "✅ 들어감" if b.fits else "❌ 초과"
     print(f"│  판정: {verdict}  (여유 {b.headroom_gib:+.2f} GiB)   이 설정의 최대 컨텍스트 ≈ {b.max_ctx_fit:,} 토큰")
-    print(f"├─ 디코드 속도 상한(대역폭) ≈ {b.decode_tps_ceiling:6.1f} tok/s   현실적 ≈ {b.decode_tps_realistic:6.1f} tok/s")
+    print(f"├─ 디코드 속도 상한(대역폭) ≈ {b.decode_tps_ceiling:6.1f} tok/s   추정 ≈ {b.decode_tps_realistic:6.1f} tok/s  (실측 대비 ±30%; llama-bench 로 확인)")
     print(f"│  토큰당 GPU 읽기 {b.gpu_bytes_per_token/1e9:.2f} GB, CPU 읽기 {b.cpu_bytes_per_token/1e9:.2f} GB;  프리필 대략 ≈ {b.prefill_tps_rough:,.0f} tok/s")
     for n in b.notes:
         print(f"│  ⚠ {n}")

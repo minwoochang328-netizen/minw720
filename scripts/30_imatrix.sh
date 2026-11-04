@@ -14,6 +14,8 @@
 #     CHUNKS=256      처리할 청크 수 (-1 = 전부)
 #     MOE_CPU=auto    MoE 모델이면 전문가를 CPU 에 두고(--cpu-moe) 어텐션만 GPU. 8GB VRAM 필수 설정.
 #     THREADS=8       9700X 물리 코어 수
+#     PARSE_SPECIAL=1 캘리브레이션 텍스트에 채팅 템플릿 특수 토큰(<start_of_turn> 등)이 포함되어 있으면 1 (instruct 모델 권장)
+#     NEXTN=0         GGUF 안에 MTP/NextN 레이어가 내장된 모델이면 1 (드래프터가 별도 파일이면 0)
 #   비고: F16/BF16 원본이 8GB 에 안 들어가도 됩니다 — 가중치는 RAM 에서 mmap 되고,
 #         GPU 에는 비전문가 레이어만 올라갑니다. (gpt-oss-20b F16 13.8GB + 32GB RAM = OK)
 # =============================================================================
@@ -22,6 +24,7 @@ MODEL="${1:?사용법: $0 <model.gguf> [calib.txt] [out.gguf]}"
 CALIB="${2:-$(dirname "$0")/../calib/calibration_ko_en_code.txt}"
 OUT="${3:-${MODEL%.gguf}.imatrix.gguf}"
 NGL="${NGL:-99}"; CTX="${CTX:-2048}"; CHUNKS="${CHUNKS:-256}"; THREADS="${THREADS:-8}"; MOE_CPU="${MOE_CPU:-auto}"
+PARSE_SPECIAL="${PARSE_SPECIAL:-0}"; NEXTN="${NEXTN:-0}"
 
 [ -f "$CALIB" ] || { echo "[!] 캘리브레이션 파일이 없습니다: $CALIB  → python calib/build_calibration_set.py 먼저 실행" >&2; exit 1; }
 
@@ -36,6 +39,9 @@ sys.exit(0 if any(k.endswith('.expert_count') for k in r.fields) else 1)
 PY
   then MOE_FLAGS=(--cpu-moe); echo "[*] MoE 감지 → 전문가 가중치는 CPU(RAM), 어텐션/라우터/임베딩만 GPU"; fi
 elif [ "$MOE_CPU" = "1" ]; then MOE_FLAGS=(--cpu-moe); fi
+EXTRA_FLAGS=()
+[ "$PARSE_SPECIAL" = "1" ] && EXTRA_FLAGS+=(--parse-special)
+[ "$NEXTN" = "1" ] && EXTRA_FLAGS+=(--nextn)
 
 echo "[*] imatrix 생성: $MODEL"
 echo "    calib=$CALIB ctx=$CTX chunks=$CHUNKS → $OUT"
@@ -44,7 +50,7 @@ llama-imatrix \
   -ngl "$NGL" -c "$CTX" -b "$CTX" -ub 512 \
   --chunks "$CHUNKS" --output-frequency 20 \
   -t "$THREADS" -fa on \
-  "${MOE_FLAGS[@]}"
+  "${MOE_FLAGS[@]}" "${EXTRA_FLAGS[@]}"
 
 echo "[OK] $OUT"
 llama-imatrix --in-file "$OUT" --show-statistics 2>/dev/null | head -40 || true
