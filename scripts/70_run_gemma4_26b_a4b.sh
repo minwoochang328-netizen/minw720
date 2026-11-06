@@ -16,7 +16,7 @@
 set -euo pipefail
 MODEL="${MODEL:-models/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf}"
 DRAFT="${DRAFT:-}"
-CTX="${CTX:-65536}"; NCMOE="${NCMOE:-22}"; CACHE_MIB="${CACHE_MIB:-1536}"; KV="${KV:-q8_0}"; PORT="${PORT:-8080}"; THREADS="${THREADS:-8}"
+CTX="${CTX:-65536}"; NCMOE="${NCMOE:-24}"; CACHE_MIB="${CACHE_MIB:-1024}"; KV="${KV:-q8_0}"; PORT="${PORT:-8080}"; THREADS="${THREADS:-8}"   # 32K 이면 NCMOE=22 가능. --fit on 이 넘치면 자동 조정
 FIT_TARGET="${FIT_TARGET:-768}"   # Windows 데스크톱이면 1280
 
 ARGS=(-m "$MODEL" --no-mmproj --jinja -fa on -t "$THREADS" -tb "$THREADS"
