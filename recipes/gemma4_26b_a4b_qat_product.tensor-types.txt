@@ -1,0 +1,18 @@
+# ── Gemma 4 26B-A4B "QAT 소스 + 8비트 GPU 경로" 판매용 S 빌드 (설계 패널 최종안, docs/09 §2.3) ─────────
+# 소스: google/gemma-4-26B-A4B-it-qat-q4_0-unquantized (Google Q4_0 QAT 파이프라인에서 추출한 반정밀 가중치, Apache-2.0)
+# 명령: scripts/40_quantize.sh <qat-unq-bf16.gguf> <out.gguf> Q4_0 recipes/gemma4_26b_a4b_qat_product.tensor-types.txt [imatrix]
+#       EMBED_TYPE=q8_0 OUTPUT_TYPE=q8_0   → 파일 ≈ 14.30 GiB, GPU 6.45 GiB @ --n-cpu-moe 24 / 64K q8_0 KV (계산기)
+# 표준 타입(q4_0/q8_0/f16)만 사용 → 어떤 llama.cpp 계열 런타임에서도 로드.
+#
+# ⚠ 적대적 검증 정정(docs/08 §4 Q1): llama.cpp 의 RTN Q4_0(FP16 스케일, signed-max/-8 규칙)은
+#   Google QAT 격자(BF16 스케일)를 그대로 재현하지 못합니다(Unsloth: 단순 변환 바이트 일치 ≈25%, E2B KLD ≈0.05).
+#   따라서 전문가 Q4_0 은 아래 세 후보를 한/영 KLD 로 비교해 고릅니다(게이트 G1/G2):
+#     (a) RTN Q4_0 (imatrix 없이)  (b) imatrix Q4_0 (가중 스케일 탐색)  (c) 외부 기준: Google 공식 QAT GGUF / Unsloth QAT GGUF
+#   (b) 가 기본 후보에 가깝고, (c) 보다 나쁘면 출시하지 않습니다.
+# ⚠ ffn_down_exps(ne0 704)·공유 ffn_down(ne0 2112)은 256 의 배수가 아님 → K/I-quant 금지, 블록-32 타입만(여기선 q4_0/q8_0).
+# 규칙: regex_search, 첫 번째 일치가 적용.
+ffn_gate_inp=f16
+exp_probs_b=f16
+attn_(q|k|v|output)=q8_0
+ffn_(gate|up|down)\.weight=q8_0
+ffn_(gate|up|down|gate_up)_exps=q4_0

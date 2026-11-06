@@ -5,6 +5,7 @@ exp_probs_b=f16
 ffn_(gate|up|down)_shexp=q6_k
 attn_(q|k|v|output|qkv|q_a|q_b|kv_a_mqa|kv_b|k_b|v_b)=q8_0
 ssm_(in|out|x|dt|a|d|conv1d|norm)=q8_0
+# ⚠ Gemma 4 26B-A4B(ffn_down_exps ne0=704)에는 맞지 않음(IQ4_XS→IQ4_NL 폴백) → gemma4_26b_a4b_* 레시피 사용.
 ffn_down_exps=iq4_xs
 ffn_(gate|up|gate_up)_exps=iq3_s
 ffn_(gate|up|down)\.weight=q6_k
