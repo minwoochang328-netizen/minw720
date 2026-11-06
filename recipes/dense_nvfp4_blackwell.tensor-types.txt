@@ -1,0 +1,11 @@
+# ── RTX 50(Blackwell) 전용 NVFP4 레시피 (베이스 ftype: Q8_0 로 주고 아래가 나머지를 nvfp4 로 덮음) ─
+# NVFP4: 16개 단위 E4M3 스케일 + 텐서 스케일 → 4.5 bpw, 5세대 텐서코어 FP4 MMA 네이티브.
+# 민감 텐서만 6비트로 보호하고 나머지 모든 선형층을 nvfp4 로.
+blk\.(0|1)\.(attn|ffn)_.*=q6_k
+attn_v=q6_k
+ffn_down=q6_k
+attn_(q|k|output|qkv)=nvfp4
+ffn_(gate|up)=nvfp4
+ffn_(gate|up|down|gate_up)_exps=nvfp4
+ffn_(gate|up|down)_shexp=q6_k
+ffn_gate_inp=f16

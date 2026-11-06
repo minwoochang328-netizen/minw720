@@ -1,0 +1,14 @@
+# ── Gemma 4 26B-A4B "HiFi64" (64 GB RAM 전용 A-2 티어, docs/09 §3.2) — 704 열 문제를 반영한 정정판 ─────────
+# 소스: google/gemma-4-26B-A4B-it 원본 bf16 → BF16 GGUF → en+ko+code imatrix → llama-quantize
+# 명령: scripts/40_quantize.sh <bf16.gguf> <out.gguf> Q5_K_M recipes/gemma4_26b_a4b_hifi64.tensor-types.txt <imatrix>
+#       EMBED_TYPE=q8_0 OUTPUT_TYPE=q8_0   → 파일 ≈ 19.6 GiB, RAM 전문가 ≈ 14.4 GiB → 32 GB RAM 에선 빠듯
+# 왜 정정했나: moe_intermediate_size 704 → ffn_down_exps ne0 = 704 는 QK_K(256)의 배수가 아님.
+#   Q6_K 를 지정하면 llama-quant.cpp tensor_type_fallback 이 경고와 함께 Q8_0 으로 바꿈 → 처음부터 q8_0 명시.
+#   gate/up_exps(ne0 2816 = 11×256)는 K-quant 가능. 공유 ffn_down(2112)도 블록-32 → q8_0.
+# 규칙: regex_search, 첫 번째 일치가 적용.
+ffn_gate_inp=f16
+exp_probs_b=f16
+attn_(q|k|v|output)=q8_0
+ffn_(gate|up|down)\.weight=q8_0
+ffn_down_exps=q8_0
+ffn_(gate|up|gate_up)_exps=q5_k

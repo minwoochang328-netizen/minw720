@@ -1,0 +1,23 @@
+# ── Gemma 4 12B Unified → 8 GB 완전 상주 "A5" 레시피 (A-1 속도 SKU, docs/09 §3.1; 설계 패널 아키텍트 A) ──
+# 12B 는 hidden 3840(=15×256), FFN 15360(=60×256) → 모든 행렬이 256 배수라 K/I-quant 폴백 없음.
+# 명령: scripts/40_quantize.sh <bf16.gguf> <out.gguf> IQ3_S recipes/gemma4_12b_koen_A5.tensor-types.txt <imatrix>  (+ EMBED_TYPE/OUTPUT_TYPE 아래 변형 참고)
+# ⚠ IQ3_S 사용 → CUDA 13.2.0/13.2.1 빌드 금지(sm_120 IQ 커널 미스컴파일 #28581).
+# Base ftype for llama-quantize: IQ3_S   (imatrix REQUIRED — en+ko+code calibration, see pipeline step 4)
+# token_embd (tied → also the lm_head) is set on the command line, three variants of the same body:
+#   A5      (Linux/headless, 16–32K):      --token-embedding-type q5_k --output-tensor-type q5_k   (file ≈ 6.12 GB / 5.70 GiB)
+#   A5-W    (Windows desktop, ≤16K):       --token-embedding-type q4_k --output-tensor-type q4_k   (file ≈ 5.99 GB / 5.58 GiB)
+#   A5-trim (script-rule en+ko vocab trim, 172,632 rows): --token-embedding-type q6_k --output-tensor-type q6_k (file ≈ 5.97 GB / 5.56 GiB)
+#   A5-trim-freq (frequency trim ≈ 90K rows, hypothesis): --token-embedding-type q8_0 --output-tensor-type q8_0 (file ≈ 5.80 GB / 5.40 GiB)
+# Rules are regex_search, first match wins (order matters).
+# first / last layer: most sensitive → 5-bit everything
+blk\.(0|47)\.(attn|ffn)_.*=q5_k
+# K/V projections (0.645B params total): position/value fidelity, cheap → 6-bit
+attn_v=q6_k
+attn_k=q6_k
+# FFN down carries most of the low-bit error (NVIDIA GLM-5.3-Flash study, corpus 04 §8) → one tier up
+ffn_down=iq4_xs
+# Q / O projections → IQ4_XS
+attn_(q|output)=iq4_xs
+# the two largest tensors (gate+up = 5.66B params) stay at the IQ3_S base (imatrix-calibrated)
+ffn_(gate|up)=iq3_s
+# norms stay f32 automatically; nothing else to match

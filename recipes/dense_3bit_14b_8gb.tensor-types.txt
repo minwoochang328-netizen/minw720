@@ -1,0 +1,7 @@
+# ── 12~14B 밀집 모델을 8GB 에 넣기 (베이스 ftype: IQ3_M 또는 IQ3_S, imatrix 필수) ────
+# 3비트대에서는 "무엇을 보호할지"가 품질의 전부. 임베딩/출력은 --token-embedding-type q6_k --output-tensor-type q6_k
+blk\.(0|1)\.(attn|ffn)_.*=q5_k
+attn_v=q5_k
+attn_k=iq4_xs
+ffn_down=iq4_xs
+# 나머지(attn_q, attn_output, ffn_gate, ffn_up) 는 IQ3_M/IQ3_S 베이스 그대로
